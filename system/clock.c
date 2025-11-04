@@ -5,30 +5,39 @@
 #include <errno.h>
 #include <string.h>
 
-struct PCB {
+typedef struct {
     int pid;
     // Additional fields to be added
-};
+} PCB;
 
-struct Machine {
-    int num_kernel_threads;
-    struct PCB* pcbs;  // Array of process control blocks
-};
-
-struct ProcessQueue {
+typedef struct {
     struct PCB** queue;
     int front;
     int rear;
     int max_capacity;
     int current_size;
-};
+} ProcessQueue;
 
-struct Timer {
+// Machine -> CPU -> Core (PCBs of kernel threads)
+typedef struct {
+    int num_CPUs;
+    CPU* cpus;
+} Machine;
+typedef struct {
+    int num_cores;
+    Core* cores;
+} CPU;
+typedef struct {
+    int num_kernel_threads;
+    PCB* pcbs;
+} Core;
+
+typedef struct {
     int id;
     int interval;    // Interval of clock ticks after which interrupts
     int last_tick;   // Last processed clock tick
     pthread_t thread;
-};
+} Timer;
 
 // Global frequency of the clock
 int frequency = 1000000; // Default to 1 MHz
@@ -40,7 +49,7 @@ static volatile int clk_counter = 0;  // Shared tick counter
 
 // Timer waits for {interval} clock ticks and generates an interruption
 void* timer_function(void* arg) {
-    struct Timer* timer = (struct Timer*)arg;
+    Timer* timer = (Timer*)arg;
     
     while (1) {
         pthread_mutex_lock(&clk_mutex);
@@ -52,8 +61,7 @@ void* timer_function(void* arg) {
         
         // Generate timer interruption
         timer->last_tick = clk_counter;
-        printf("Timer %d interrupted at tick %d (interval=%d)\n",
-               timer->id, clk_counter, timer->interval);
+        printf("Timer %d interrupted at tick %d (interval=%d)\n", timer->id, clk_counter, timer->interval);
         fflush(stdout);
         
         pthread_cond_signal(&timer_cond);
@@ -83,9 +91,9 @@ void* clock_function() {
 
 
 // Initialize a new timer with given parameters
-struct Timer* create_timer(int id, int interval) {
-    struct Timer* timer = malloc(sizeof(struct Timer));
-    
+Timer* create_timer(int id, int interval) {
+    Timer* timer = malloc(sizeof(Timer));
+
     timer->id = id;
     timer->interval = interval;
     timer->last_tick = clk_counter;
@@ -101,7 +109,7 @@ struct Timer* create_timer(int id, int interval) {
 }
 
 // Clean up system resources
-void cleanup_system(pthread_t clock_thread, struct Timer** timers, int num_timers) {
+void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
     int ret;
     ret = pthread_cancel(clock_thread);
     if (ret != 0) {
@@ -130,6 +138,8 @@ void cleanup_system(pthread_t clock_thread, struct Timer** timers, int num_timer
 }
 
 int main(int argc, char *argv[]) {
+    Machine machine;
+
     int process_interval;
     // Parse command line arguments
     if (argc == 2 && strcmp(argv[1], "-help") == 0) {
@@ -141,16 +151,16 @@ int main(int argc, char *argv[]) {
     
    
     pthread_t clk_thread;
-    // Initialize system clock
+    // Create clock thread
     int ret = pthread_create(&clk_thread, NULL, clock_function, NULL);
     if (ret != 0) {
         fprintf(stderr, "Error creating clock thread: %s\n", strerror(ret));
         return 1;
     }
     
-    // Create timer threads
-    const int NUM_TIMERS = 2;
-    struct Timer *timers[NUM_TIMERS];
+    // Create timers
+    int NUM_TIMERS = 2;
+    Timer *timers[NUM_TIMERS];
     for(int i=0; i<NUM_TIMERS; i++) {
         if ((timers[i] = create_timer(i, i+1)) == NULL) {
             fprintf(stderr, "Error creating timer %d\n", i);
@@ -158,9 +168,9 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Run system for specified duration
     printf("System running at %d Hz. Press Ctrl+C to exit...\n", frequency);
-    pause(); // Wait indefinitely until interrupted    
+    wait();  
+
     // Cleanup and exit
     cleanup_system(clk_thread, timers, NUM_TIMERS);
     for(int i=0; i<NUM_TIMERS; i++) { 
