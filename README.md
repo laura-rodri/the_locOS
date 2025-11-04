@@ -1,2 +1,2 @@
-# d_locOS
-Sistema operativo que funciona de locos
+# the_locOS
+Sistema operativo de locos.

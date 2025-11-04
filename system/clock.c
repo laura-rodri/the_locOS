@@ -26,7 +26,6 @@ struct ProcessQueue {
 struct Timer {
     int id;          // Unique identifier for the timer
     int interval;    // Interrupt interval in clock ticks
-    int ticks;       // Current tick count
     int last_tick;   // Last processed clock tick
     pthread_t thread; // Thread handling the timer
 };
@@ -36,44 +35,56 @@ int frequency = 1000000; // Default to 1 MHz
 
 // Synchronization primitives
 static pthread_mutex_t clk_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t clk_cond1 = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t clk_cond2 = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t clk_cond = PTHREAD_COND_INITIALIZER;  // For signaling clock ticks
 
-static int clk_counter = 0;
+static volatile int clk_counter = 0;  // Shared tick counter
 
-// Timer waits for clock ticks and generates interruptions
+// Timer waits for clock ticks and generates interruptions when its interval has elapsed
 void* timer_function(void* arg) {
     struct Timer* timer = (struct Timer*)arg;
+    
     pthread_mutex_lock(&clk_mutex);
+    // Initialize last_tick to current counter on first run
+    if (timer->last_tick < 0) {
+        timer->last_tick = clk_counter;
+    }
+    pthread_mutex_unlock(&clk_mutex);
+    
     while (1) {
-        clk_counter++;
-        pthread_cond_signal(&clk_cond1);
-        // Check if it's time to generate an interrupt
-        while (clk_counter - timer->last_tick < timer->interval) {
-            pthread_cond_wait(&clk_cond2, &clk_mutex);
+        pthread_mutex_lock(&clk_mutex);
+        
+        // Wait for enough clock ticks to pass since last interrupt
+        while ((clk_counter - timer->last_tick) < timer->interval) {
+            pthread_cond_wait(&clk_cond, &clk_mutex);
         }
+        
         // Generate timer interrupt
         timer->last_tick = clk_counter;
-        printf("Timer %d interrupt at tick %d\n", timer->id, clk_counter);
+        printf("Timer %d interrupt at tick %d (interval=%d)\n", 
+               timer->id, clk_counter, timer->interval);
+        fflush(stdout); // Force output immediately
+        
+        pthread_mutex_unlock(&clk_mutex);
     }
-    
+    return NULL;
 }
 
 /**
  * System clock thread
  * Generates periodic clock ticks at specified frequency
  */
-void* clock_function(void* arg) {
+void* clock_function() {
     while (1) {
+        usleep(frequency); // Wait one clock period
+        
         pthread_mutex_lock(&clk_mutex);
-        while(clk_counter < frequency) {
-            pthread_cond_wait(&clk_cond1, &clk_mutex);
-        }
-        clk_counter=0;
-        pthread_cond_broadcast(&clk_cond2);
+        clk_counter++;
+
+        pthread_cond_broadcast(&clk_cond);
+        
+        printf("Clock tick %d\n", clk_counter);
+        fflush(stdout); // Force output immediately
         pthread_mutex_unlock(&clk_mutex);
-        printf("Clock tick\n");
-        usleep(frequency);
     }
     return NULL;
 }
@@ -86,9 +97,8 @@ struct Timer* create_timer(int id, int interval) {
     
     timer->id = id;
     timer->interval = interval;
-    timer->ticks = 0;
     timer->last_tick = -1;
-    
+
     int ret = pthread_create(&timer->thread, NULL, timer_function, (void*)timer);
     if (ret != 0) {
         printf("Error creating timer thread: %s\n", strerror(ret));
@@ -100,50 +110,68 @@ struct Timer* create_timer(int id, int interval) {
 }
 
 // Clean up system resources
-void cleanup_system(pthread_t clock_thread, pthread_t* timer_threads, int num_timers) {
-    pthread_cancel(clock_thread);
+void cleanup_system(pthread_t clock_thread, struct Timer** timers, int num_timers) {
+    int ret;
+    ret = pthread_cancel(clock_thread);
+    if (ret != 0) {
+        fprintf(stderr, "Error cancelling clock thread: %s\n", strerror(ret));
+    }
     pthread_join(clock_thread, NULL);
     
-    for(int i=0; i<num_timers; i++) {
-        pthread_cancel(timer_threads[i]);
-        pthread_join(timer_threads[i], NULL);
+    for (int i = 0; i < num_timers; i++) {
+        if (timers[i] == NULL) continue;
+        ret = pthread_cancel(timers[i]->thread);
+        if (ret != 0) {
+            fprintf(stderr, "Error cancelling timer %d: %s\n", i, strerror(ret));
+        }
+        pthread_join(timers[i]->thread, NULL);
     }
     
-    pthread_mutex_destroy(&clk_mutex);
-    pthread_cond_destroy(&clk_cond1);
-    pthread_cond_destroy(&clk_cond2);
+    ret = pthread_mutex_destroy(&clk_mutex);
+    if (ret != 0) {
+        fprintf(stderr, "Error destroying mutex: %s\n", strerror(ret));
+    }
+    
+    ret = pthread_cond_destroy(&clk_cond);
+    if (ret != 0) {
+        fprintf(stderr, "Error destroying condition variable: %s\n", strerror(ret));
+    }
 }
 
 int main(int argc, char *argv[]) {
-    double process_interval;
+    int process_interval;
     // Parse command line arguments
-    if( argc==2 && argv[1]=="-help"){
+    if (argc == 2 && strcmp(argv[1], "-help") == 0) {
         printf("Usage: %s [frequency] [process_interval]\n", argv[0]);
         return 0;
     }
-    frequency = (argc > 1) ? 1000000/atof(argv[1]) : 1000000;
-    process_interval = (argc > 2) ? atof(argv[2]) : 5;
+    frequency = (argc > 1) ? 1000000/atof(argv[1]) : 1000000; // Default 1s per tick
+    process_interval = (argc > 2) ? atoi(argv[2]) : 5; // Default 5 ticks (not milliseconds!)
     
    
     pthread_t clk_thread;
     // Initialize system clock
-    pthread_create(&clk_thread, NULL, (void*)clock_function, NULL);
+    int ret = pthread_create(&clk_thread, NULL, clock_function, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "Error creating clock thread: %s\n", strerror(ret));
+        return 1;
+    }
     
     // Create timer threads
     const int NUM_TIMERS = 2;
     struct Timer *timers[NUM_TIMERS];
     for(int i=0; i<NUM_TIMERS; i++) {
-        if ((timers[i] = create_timer(i, (int)(process_interval*1000)))== NULL) {
+        if ((timers[i] = create_timer(i, i+1)) == NULL) {
+            fprintf(stderr, "Error creating timer %d\n", i);
             return 1;
         }
     }
     
     // Run system for specified duration
     printf("System running at %d Hz. Press Ctrl+C to exit...\n", frequency);
-    sleep(10);
-    
+    pause(); // Wait indefinitely until interrupted    
     // Cleanup and exit
-    cleanup_system(clk_thread, (pthread_t*)timers, NUM_TIMERS);
+    cleanup_system(clk_thread, timers, NUM_TIMERS);
     for(int i=0; i<NUM_TIMERS; i++) { 
         free(timers[i]);
     }
