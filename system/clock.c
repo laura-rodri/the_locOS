@@ -19,71 +19,62 @@ struct ProcessQueue {
     struct PCB** queue;
     int front;
     int rear;
-    int capacity;
-    int size;
+    int max_capacity;
+    int current_size;
 };
 
 struct Timer {
-    int id;          // Unique identifier for the timer
-    int interval;    // Interrupt interval in clock ticks
+    int id;
+    int interval;    // Interval of clock ticks after which interrupts
     int last_tick;   // Last processed clock tick
-    pthread_t thread; // Thread handling the timer
+    pthread_t thread;
 };
 
-// Global frequency of the system clock in microseconds
+// Global frequency of the clock
 int frequency = 1000000; // Default to 1 MHz
 
-// Synchronization primitives
 static pthread_mutex_t clk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t clk_cond = PTHREAD_COND_INITIALIZER;  // For signaling clock ticks
-
+static pthread_cond_t timer_cond = PTHREAD_COND_INITIALIZER; // For signaling timer jobs. Currently unaffect the program
 static volatile int clk_counter = 0;  // Shared tick counter
 
-// Timer waits for clock ticks and generates interruptions when its interval has elapsed
+// Timer waits for {interval} clock ticks and generates an interruption
 void* timer_function(void* arg) {
     struct Timer* timer = (struct Timer*)arg;
-    
-    pthread_mutex_lock(&clk_mutex);
-    // Initialize last_tick to current counter on first run
-    if (timer->last_tick < 0) {
-        timer->last_tick = clk_counter;
-    }
-    pthread_mutex_unlock(&clk_mutex);
     
     while (1) {
         pthread_mutex_lock(&clk_mutex);
         
-        // Wait for enough clock ticks to pass since last interrupt
+        // Wait for enough clock ticks to pass since last interruption
         while ((clk_counter - timer->last_tick) < timer->interval) {
             pthread_cond_wait(&clk_cond, &clk_mutex);
         }
         
-        // Generate timer interrupt
+        // Generate timer interruption
         timer->last_tick = clk_counter;
-        printf("Timer %d interrupt at tick %d (interval=%d)\n", 
+        printf("Timer %d interrupted at tick %d (interval=%d)\n",
                timer->id, clk_counter, timer->interval);
-        fflush(stdout); // Force output immediately
+        fflush(stdout);
         
+        pthread_cond_signal(&timer_cond);
         pthread_mutex_unlock(&clk_mutex);
     }
     return NULL;
 }
 
-/**
- * System clock thread
- * Generates periodic clock ticks at specified frequency
- */
+// Clock increments clk_counter at desired frequency and signals waiting threads
 void* clock_function() {
     while (1) {
         usleep(frequency); // Wait one clock period
         
         pthread_mutex_lock(&clk_mutex);
         clk_counter++;
-
         pthread_cond_broadcast(&clk_cond);
         
         printf("Clock tick %d\n", clk_counter);
         fflush(stdout); // Force output immediately
+
+        pthread_cond_wait(&timer_cond, &clk_mutex);
         pthread_mutex_unlock(&clk_mutex);
     }
     return NULL;
@@ -97,7 +88,7 @@ struct Timer* create_timer(int id, int interval) {
     
     timer->id = id;
     timer->interval = interval;
-    timer->last_tick = -1;
+    timer->last_tick = clk_counter;
 
     int ret = pthread_create(&timer->thread, NULL, timer_function, (void*)timer);
     if (ret != 0) {
