@@ -4,10 +4,17 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <signal.h>
+
+
+#define RUNNING 0
+#define WAITING 1
+#define TERMINATED 2
 
 typedef struct {
     int pid;
-    // Additional fields to be added
+    int state;
+    // etc
 } PCB;
 
 typedef struct {
@@ -32,6 +39,8 @@ typedef struct {
     CPU* cpus;
 } Machine;
 
+
+
 typedef struct {
     int id;
     int interval;    // Interval of clock ticks after which interrupts
@@ -39,7 +48,6 @@ typedef struct {
     pthread_t thread;
 } Timer;
 
-#include <signal.h>
 
 // Global frequency of the clock. Default 1 Hz
 int CLOCK_FREQUENCY_HZ = 1;
@@ -143,6 +151,7 @@ void handle_sigint(int sig) {
 }
 
 int main(int argc, char *argv[]) {
+    // 
     int process_interval;
     // Parse command line arguments
     if (argc == 2 && strcmp(argv[1], "-help") == 0) {
@@ -151,7 +160,7 @@ int main(int argc, char *argv[]) {
     }
     if (argc > 1)
         CLOCK_FREQUENCY_HZ = (atoi(argv[1])>0) ? atoi(argv[1]) : 1;
-    
+
     process_interval = (argc > 2) ? atoi(argv[2]) : 5; // Default 5 ticks (not milliseconds!)
     
     // Set up signal handler for Ctrl+C
