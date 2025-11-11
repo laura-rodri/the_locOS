@@ -48,7 +48,7 @@ PCB* dequeue_process(ProcessQueue* pq);
 
 // Process Generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
-                                          int max_processes, ProcessQueue* ready_queue);
+                                           int max_processes, ProcessQueue* ready_queue);
 void start_process_generator(ProcessGenerator* pg);
 void stop_process_generator(ProcessGenerator* pg);
 void destroy_process_generator(ProcessGenerator* pg);

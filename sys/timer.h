@@ -9,6 +9,7 @@ typedef struct {
     int interval;    // Interval of clock ticks after which interrupts
     int last_tick;   // Last processed clock tick
     pthread_t thread;
+    volatile int running;  // Flag to control timer execution
 } Timer;
 
 // Function declarations

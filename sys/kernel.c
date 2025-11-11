@@ -14,16 +14,30 @@ static Timer** timers_global = NULL;
 static int num_timers_global = 0;
 static ProcessGenerator* proc_gen_global = NULL;
 static ProcessQueue* ready_queue_global = NULL;
+static volatile int running = 1;  // Flag to control main loop
 
 // Clean up system resources
 void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
+    printf("Stopping process generator...\n");
+    fflush(stdout);
+    
     // Stop process generator
     if (proc_gen_global) {
         stop_process_generator(proc_gen_global);
         destroy_process_generator(proc_gen_global);
     }
     
+    printf("Stopping clock...\n");
+    fflush(stdout);
     stop_clock(clock_thread);
+    
+    printf("Stopping timers...\n");
+    fflush(stdout);
+    
+    // Wake up all waiting threads before canceling
+    pthread_mutex_lock(&clk_mutex);
+    pthread_cond_broadcast(&clk_cond);
+    pthread_mutex_unlock(&clk_mutex);
     
     for (int i = 0; i < num_timers; i++) {
         if (timers[i] != NULL) {
@@ -31,6 +45,8 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         }
     }
     
+    printf("Cleaning ready queue...\n");
+    fflush(stdout);
     // Clean up ready queue and remaining processes
     if (ready_queue_global) {
         PCB* pcb;
@@ -40,6 +56,8 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         destroy_process_queue(ready_queue_global);
     }
     
+    printf("Destroying mutexes...\n");
+    fflush(stdout);
     pthread_mutex_destroy(&clk_mutex);
     pthread_cond_destroy(&clk_cond);
 }
@@ -47,16 +65,13 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
 // Catch Ctrl+C to clean up and exit successfully
 void handle_sigint(int sig) {
     printf("\nCaught signal %d, shutting down...\n", sig);
-    cleanup_system(clk_thread_global, timers_global, num_timers_global);
-    free(timers_global);
-    printf("System shutdown complete\n");
-    exit(0);
+    running = 0;  // Signal main loop to exit
 }
 
 int main(int argc, char *argv[]) {
     int process_interval = 5;     // Default timer interval
-    int proc_gen_min = 3;         // Default min interval for process generation
-    int proc_gen_max = 10;        // Default max interval for process generation
+    int proc_gen_min = 3;         // Default min interval for process generation (ticks)
+    int proc_gen_max = 10;        // Default max interval for process generation (ticks)
     int max_processes = 20;       // Default max processes to generate (0 = unlimited)
     int ready_queue_size = 100;   // Default ready queue capacity
     
@@ -66,8 +81,8 @@ int main(int argc, char *argv[]) {
         printf("Flags:\n");
         printf("   -f <hz>           Clock frequency in Hz (default: 1)\n");
         printf("   -t <ticks>        Timer interrupt interval (default: 5)\n");
-        printf("   -pmin <ticks>     Min interval for process generation (default: 3)\n");
-        printf("   -pmax <ticks>     Max interval for process generation (default: 10)\n");
+        printf("   -pmin <ticks>     Min interval for process generation in ticks (default: 3)\n");
+        printf("   -pmax <ticks>     Max interval for process generation in ticks (default: 10)\n");
         printf("   -pcount <num>     Max processes to generate, 0=unlimited (default: 20)\n");
         printf("   -qsize <num>      Ready queue size (default: 100)\n");
         return 0;
@@ -75,24 +90,26 @@ int main(int argc, char *argv[]) {
 
     if (argc > 1){
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "-f")==0 && i+1<argc) {
-                i++;
-                CLOCK_FREQUENCY_HZ = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 1;
-            } else if (strcmp(argv[i], "-t")==0 && i+1<argc) {
-                i++;
-                process_interval = atoi(argv[i]);
-            } else if (strcmp(argv[i], "-pmin")==0 && i+1<argc) {
-                i++;
-                proc_gen_min = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 1;
-            } else if (strcmp(argv[i], "-pmax")==0 && i+1<argc) {
-                i++;
-                proc_gen_max = (atoi(argv[i]) > 0) ? atoi(argv[i]) : proc_gen_min;
-            } else if (strcmp(argv[i], "-pcount")==0 && i+1<argc) {
-                i++;
-                max_processes = atoi(argv[i]);
-            } else if (strcmp(argv[i], "-qsize")==0 && i+1<argc) {
-                i++;
-                ready_queue_size = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 100;
+            if(i+1<argc){
+                if (strcmp(argv[i], "-f")==0) {
+                    i++;
+                    CLOCK_FREQUENCY_HZ = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 1;
+                } else if (strcmp(argv[i], "-t")==0) {
+                    i++;
+                    process_interval = atoi(argv[i]);
+                } else if (strcmp(argv[i], "-pmin")==0) {
+                    i++;
+                    proc_gen_min = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 3;
+                } else if (strcmp(argv[i], "-pmax")==0) {
+                    i++;
+                    proc_gen_max = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 10;
+                } else if (strcmp(argv[i], "-pcount")==0) {
+                    i++;
+                    max_processes = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 20;
+                } else if (strcmp(argv[i], "-qsize")==0) {
+                    i++;
+                    ready_queue_size = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 100;
+                }
             }
         }
     }
@@ -161,9 +178,16 @@ int main(int argc, char *argv[]) {
     printf("Ready queue size:     %d\n", ready_queue_size);
     printf("\nPress Ctrl+C to exit...\n\n");
     
-    // Wait for a signal
-    pause();
+    // Wait for signal using pause() which will be interrupted by SIGINT
+    while (running) {
+        pause();  // Blocks until a signal is received
+    }
+    
+    // Cleanup
+    printf("Cleaning up...\n");
+    cleanup_system(clk_thread_global, timers_global, num_timers_global);
+    free(timers_global);
+    printf("System shutdown complete\n");
 
-    // This part is now unreachable because of the signal handler
     return 0;
 }

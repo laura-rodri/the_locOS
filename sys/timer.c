@@ -8,12 +8,17 @@
 void* timer_function(void* arg) {
     Timer* timer = (Timer*)arg;
     
-    while (1) {
+    while (timer->running) {
         pthread_mutex_lock(&clk_mutex);
         
         // Wait for enough clock ticks to pass since last interruption
-        while ((clk_counter - timer->last_tick) < timer->interval) {
+        while (timer->running && (clk_counter - timer->last_tick) < timer->interval) {
             pthread_cond_wait(&clk_cond, &clk_mutex);
+        }
+        
+        if (!timer->running) {
+            pthread_mutex_unlock(&clk_mutex);
+            break;
         }
         
         // Generate timer interruption
@@ -35,6 +40,7 @@ Timer* create_timer(int id, int interval) {
     timer->id = id;
     timer->interval = interval;
     timer->last_tick = clk_counter;
+    timer->running = 1;
 
     int ret = pthread_create(&timer->thread, NULL, timer_function, (void*)timer);
     if (ret != 0) {
@@ -49,7 +55,11 @@ Timer* create_timer(int id, int interval) {
 // Destroy timer and free memory
 void destroy_timer(Timer* timer) {
     if (timer) {
-        pthread_cancel(timer->thread);
+        pthread_mutex_lock(&clk_mutex);
+        timer->running = 0;
+        pthread_cond_broadcast(&clk_cond);  // Wake up the timer
+        pthread_mutex_unlock(&clk_mutex);
+        
         pthread_join(timer->thread, NULL);
         free(timer);
     }
