@@ -20,17 +20,17 @@ typedef struct {
 
 // Machine -> CPU -> Core (PCBs of kernel threads)
 typedef struct {
-    int num_CPUs;
-    CPU* cpus;
-} Machine;
+    int num_kernel_threads;
+    PCB* pcbs;
+} Core;
 typedef struct {
     int num_cores;
     Core* cores;
 } CPU;
 typedef struct {
-    int num_kernel_threads;
-    PCB* pcbs;
-} Core;
+    int num_CPUs;
+    CPU* cpus;
+} Machine;
 
 typedef struct {
     int id;
@@ -39,13 +39,20 @@ typedef struct {
     pthread_t thread;
 } Timer;
 
-// Global frequency of the clock
-int frequency = 1000000; // Default to 1 MHz
+#include <signal.h>
+
+// Global frequency of the clock. Default 1 Hz
+int CLOCK_FREQUENCY_HZ = 1;
 
 static pthread_mutex_t clk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t clk_cond = PTHREAD_COND_INITIALIZER;  // For signaling clock ticks
 static pthread_cond_t timer_cond = PTHREAD_COND_INITIALIZER; // For signaling timer jobs. Currently unaffect the program
-static volatile int clk_counter = 0;  // Shared tick counter
+static volatile int clk_counter = 0;  // Global tick counter
+
+// Global variables for cleanup
+pthread_t clk_thread_global;
+Timer** timers_global;
+int num_timers_global;
 
 // Timer waits for {interval} clock ticks and generates an interruption
 void* timer_function(void* arg) {
@@ -73,7 +80,7 @@ void* timer_function(void* arg) {
 // Clock increments clk_counter at desired frequency and signals waiting threads
 void* clock_function() {
     while (1) {
-        usleep(frequency); // Wait one clock period
+        usleep(1000000 / CLOCK_FREQUENCY_HZ); // Wait one clock period
         
         pthread_mutex_lock(&clk_mutex);
         clk_counter++;
@@ -82,15 +89,13 @@ void* clock_function() {
         printf("Clock tick %d\n", clk_counter);
         fflush(stdout); // Force output immediately
 
-        pthread_cond_wait(&timer_cond, &clk_mutex);
+        //pthread_cond_wait(&timer_cond, &clk_mutex);
         pthread_mutex_unlock(&clk_mutex);
     }
     return NULL;
 }
 
-
-
-// Initialize a new timer with given parameters
+// Create a new timer struct (including thread) with given parameters
 Timer* create_timer(int id, int interval) {
     Timer* timer = malloc(sizeof(Timer));
 
@@ -110,45 +115,47 @@ Timer* create_timer(int id, int interval) {
 
 // Clean up system resources
 void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
-    int ret;
-    ret = pthread_cancel(clock_thread);
-    if (ret != 0) {
-        fprintf(stderr, "Error cancelling clock thread: %s\n", strerror(ret));
-    }
+    pthread_cancel(clock_thread);
+
     pthread_join(clock_thread, NULL);
     
     for (int i = 0; i < num_timers; i++) {
-        if (timers[i] == NULL) continue;
-        ret = pthread_cancel(timers[i]->thread);
-        if (ret != 0) {
-            fprintf(stderr, "Error cancelling timer %d: %s\n", i, strerror(ret));
-        }
+        if (timers[i] != NULL){
+        pthread_cancel(timers[i]->thread);
         pthread_join(timers[i]->thread, NULL);
+        }
     }
     
-    ret = pthread_mutex_destroy(&clk_mutex);
-    if (ret != 0) {
-        fprintf(stderr, "Error destroying mutex: %s\n", strerror(ret));
+    pthread_mutex_destroy(&clk_mutex);
+    pthread_cond_destroy(&clk_cond);
+    pthread_cond_destroy(&timer_cond);
+}
+
+// Catch Ctrl+C to clean up and exit successfully
+void handle_sigint(int sig) {
+    printf("\nCaught signal %d, shutting down...\n", sig);
+    cleanup_system(clk_thread_global, timers_global, num_timers_global);
+    for(int i=0; i<num_timers_global; i++) { 
+        free(timers_global[i]);
     }
-    
-    ret = pthread_cond_destroy(&clk_cond);
-    if (ret != 0) {
-        fprintf(stderr, "Error destroying condition variable: %s\n", strerror(ret));
-    }
+    printf("System shutdown complete\n");
+    exit(0);
 }
 
 int main(int argc, char *argv[]) {
-    Machine machine;
-
     int process_interval;
     // Parse command line arguments
     if (argc == 2 && strcmp(argv[1], "-help") == 0) {
-        printf("Usage: %s [frequency] [process_interval]\n", argv[0]);
+        printf("Usage: %s [frequency_in_hz] [process_interval]\n", argv[0]);
         return 0;
     }
-    frequency = (argc > 1) ? 1000000/atof(argv[1]) : 1000000; // Default 1s per tick
+    if (argc > 1)
+        CLOCK_FREQUENCY_HZ = (atoi(argv[1])>0) ? atoi(argv[1]) : 1;
+    
     process_interval = (argc > 2) ? atoi(argv[2]) : 5; // Default 5 ticks (not milliseconds!)
     
+    // Set up signal handler for Ctrl+C
+    signal(SIGINT, handle_sigint);
    
     pthread_t clk_thread;
     // Create clock thread
@@ -157,26 +164,25 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error creating clock thread: %s\n", strerror(ret));
         return 1;
     }
+    clk_thread_global = clk_thread;
     
     // Create timers
     int NUM_TIMERS = 2;
     Timer *timers[NUM_TIMERS];
     for(int i=0; i<NUM_TIMERS; i++) {
-        if ((timers[i] = create_timer(i, i+1)) == NULL) {
+        if ((timers[i] = create_timer(i, process_interval)) == NULL) {
             fprintf(stderr, "Error creating timer %d\n", i);
             return 1;
         }
     }
+    timers_global = timers;
+    num_timers_global = NUM_TIMERS;
     
-    printf("System running at %d Hz. Press Ctrl+C to exit...\n", frequency);
-    wait();  
+    printf("System running at %d Hz. Press Ctrl+C to exit...\n", CLOCK_FREQUENCY_HZ);
+    
+    // Wait for a signal
+    pause();
 
-    // Cleanup and exit
-    cleanup_system(clk_thread, timers, NUM_TIMERS);
-    for(int i=0; i<NUM_TIMERS; i++) { 
-        free(timers[i]);
-    }
-    printf("System shutdown complete\n");
-    
+    // This part is now unreachable because of the signal handler
     return 0;
 }
