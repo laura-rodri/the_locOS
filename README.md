@@ -12,6 +12,9 @@ Hundir la flota: si un proceso adivina correctamente una coordenada, puede segui
 El ahorcado: 
 
 
+# PARTE 1 EN FUNCIONAMIENTO!
+
+
 
 
 
