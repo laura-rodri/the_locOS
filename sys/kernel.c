@@ -49,6 +49,20 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
     fflush(stdout);
     // Clean up ready queue and remaining processes
     if (ready_queue_global) {
+        printf("Processes in ready queue: %d\n", ready_queue_global->current_size);
+        if (ready_queue_global->current_size > 0) {
+            printf("Process IDs in queue: ");
+            int count = ready_queue_global->current_size;
+            int idx = ready_queue_global->front;
+            for (int i = 0; i < count; i++) {
+                PCB* pcb = (PCB*)ready_queue_global->queue[idx];
+                printf("%d ", pcb->pid);
+                idx = (idx + 1) % ready_queue_global->max_capacity;
+            }
+            printf("\n");
+        }
+        fflush(stdout);
+        
         PCB* pcb;
         while ((pcb = dequeue_process(ready_queue_global)) != NULL) {
             destroy_pcb(pcb);
