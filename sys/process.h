@@ -12,6 +12,9 @@
 typedef struct {
     int pid;
     int state;
+    int priority;
+    int ttl;            // Time to live (current)
+    int initial_ttl;    // Initial TTL value (for reset)
     // etc - extend as needed
 } PCB;
 
@@ -28,6 +31,8 @@ typedef struct {
 typedef struct {
     int min_interval;        // Minimum ticks between process creation
     int max_interval;        // Maximum ticks between process creation
+    int min_ttl;             // Minimum time to live for processes
+    int max_ttl;             // Maximum time to live for processes
     int max_processes;       // Maximum number of processes to generate (0 = unlimited)
     ProcessQueue* ready_queue; // Queue where new processes are added
     pthread_t thread;        // Generator thread
@@ -36,9 +41,23 @@ typedef struct {
     volatile int total_generated; // Total processes generated
 } ProcessGenerator;
 
+// Process Manager configuration
+typedef struct {
+    ProcessQueue* active_queue;  // Queue of active processes
+    ProcessQueue* ready_queue;   // Queue to return finished processes
+    pthread_t thread;            // Manager thread
+    volatile int running;        // Flag to control manager execution
+    volatile int total_terminated; // Total processes terminated
+} ProcessManager;
+
 // PCB management
 PCB* create_pcb(int pid);
 void destroy_pcb(PCB* pcb);
+void set_pcb_priority(PCB* pcb, int priority);
+void set_pcb_ttl(PCB* pcb, int ttl);
+int get_pcb_ttl(PCB* pcb);
+int decrement_pcb_ttl(PCB* pcb);  // Returns new TTL value
+void reset_pcb_ttl(PCB* pcb);     // Reset TTL to initial value
 
 // Queue management
 ProcessQueue* create_process_queue(int capacity);
@@ -48,10 +67,18 @@ PCB* dequeue_process(ProcessQueue* pq);
 
 // Process Generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
+                                           int min_ttl, int max_ttl,
                                            int max_processes, ProcessQueue* ready_queue);
 void start_process_generator(ProcessGenerator* pg);
 void stop_process_generator(ProcessGenerator* pg);
 void destroy_process_generator(ProcessGenerator* pg);
 void* process_generator_function(void* arg);
+
+// Process Manager
+ProcessManager* create_process_manager(ProcessQueue* active_queue, ProcessQueue* ready_queue);
+void start_process_manager(ProcessManager* pm);
+void stop_process_manager(ProcessManager* pm);
+void destroy_process_manager(ProcessManager* pm);
+void* process_manager_function(void* arg);
 
 #endif // PROCESS_H

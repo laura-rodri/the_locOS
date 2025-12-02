@@ -27,13 +27,18 @@ void* timer_function(void* arg) {
                timer->id, clk_counter, timer->interval);
         fflush(stdout);
         
+        // Execute callback if provided
+        if (timer->callback) {
+            timer->callback(timer->id, timer->user_data);
+        }
+        
         pthread_mutex_unlock(&clk_mutex);
     }
     return NULL;
 }
 
 // Create a new timer struct (including thread) with given parameters
-Timer* create_timer(int id, int interval) {
+Timer* create_timer(int id, int interval, timer_callback_t callback, void* user_data) {
     Timer* timer = malloc(sizeof(Timer));
     if (!timer) return NULL;
 
@@ -41,6 +46,8 @@ Timer* create_timer(int id, int interval) {
     timer->interval = interval;
     timer->last_tick = clk_counter;
     timer->running = 1;
+    timer->callback = callback;
+    timer->user_data = user_data;
 
     int ret = pthread_create(&timer->thread, NULL, timer_function, (void*)timer);
     if (ret != 0) {
