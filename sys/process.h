@@ -33,7 +33,6 @@ typedef struct {
     int max_interval;        // Maximum ticks between process creation
     int min_ttl;             // Minimum time to live for processes
     int max_ttl;             // Maximum time to live for processes
-    int max_processes;       // Maximum number of processes to generate (0 = unlimited)
     ProcessQueue* ready_queue; // Queue where new processes are added
     pthread_t thread;        // Generator thread
     volatile int running;    // Flag to control generator execution
@@ -41,14 +40,17 @@ typedef struct {
     volatile int total_generated; // Total processes generated
 } ProcessGenerator;
 
-// Process Manager configuration
+// Scheduler configuration
 typedef struct {
-    ProcessQueue* active_queue;  // Queue of active processes
-    ProcessQueue* ready_queue;   // Queue to return finished processes
-    pthread_t thread;            // Manager thread
-    volatile int running;        // Flag to control manager execution
-    volatile int total_terminated; // Total processes terminated
-} ProcessManager;
+    int quantum;                     // Quantum (max ticks per process)
+    ProcessQueue* ready_queue;       // Queue of ready processes
+    ProcessQueue* active_queue;      // Queue with current running process (max 1)
+    pthread_t thread;                // Scheduler thread
+    volatile int running;            // Flag to control scheduler execution
+    volatile int total_completed;    // Total processes completed
+    PCB* current_process;            // Currently executing process
+    int quantum_counter;             // Current quantum counter
+} Scheduler;
 
 // PCB management
 PCB* create_pcb(int pid);
@@ -68,17 +70,18 @@ PCB* dequeue_process(ProcessQueue* pq);
 // Process Generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
                                            int min_ttl, int max_ttl,
-                                           int max_processes, ProcessQueue* ready_queue);
+                                           ProcessQueue* ready_queue);
 void start_process_generator(ProcessGenerator* pg);
 void stop_process_generator(ProcessGenerator* pg);
 void destroy_process_generator(ProcessGenerator* pg);
 void* process_generator_function(void* arg);
 
-// Process Manager
-ProcessManager* create_process_manager(ProcessQueue* active_queue, ProcessQueue* ready_queue);
-void start_process_manager(ProcessManager* pm);
-void stop_process_manager(ProcessManager* pm);
-void destroy_process_manager(ProcessManager* pm);
-void* process_manager_function(void* arg);
+// Scheduler with quantum
+Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, ProcessQueue* active_queue);
+void start_scheduler(Scheduler* sched);
+void stop_scheduler(Scheduler* sched);
+void destroy_scheduler(Scheduler* sched);
+void* scheduler_function(void* arg);
+PCB* scheduler_get_current_process(Scheduler* sched);  // Get and clear current process
 
 #endif // PROCESS_H

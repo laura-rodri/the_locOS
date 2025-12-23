@@ -129,6 +129,8 @@ void* process_generator_function(void* arg) {
     ProcessGenerator* pg = (ProcessGenerator*)arg;
     int next_generation_tick = 0;
     int interval;
+    int waiting_for_space = 0;  // Flag to track if we're waiting for queue space
+    PCB* pending_pcb = NULL;    // PCB waiting to be enqueued
     
     // Seed random number generator with current time + thread ID
     srand(time(NULL) ^ (unsigned long)pthread_self());
@@ -146,53 +148,66 @@ void* process_generator_function(void* arg) {
             break;
         }
         
-        // Check if we've reached the maximum number of processes
-        if (pg->max_processes > 0 && pg->total_generated >= pg->max_processes) {
-            pthread_mutex_unlock(&clk_mutex);
-            printf("[Process Generator] Maximum processes (%d) reached. Stopping.\n", 
-                   pg->max_processes);
-            pg->running = 0;
-            break;
-        }
-        
-        // Generate new process
-        int new_pid = __sync_fetch_and_add(&pg->next_pid, 1);
-        PCB* new_pcb = create_pcb(new_pid);
-        
-        if (new_pcb) {
-            // Set random TTL for the process
-            int ttl = pg->min_ttl;
-            if (pg->max_ttl > pg->min_ttl) {
-                ttl += rand() % (pg->max_ttl - pg->min_ttl + 1);
-            }
-            set_pcb_ttl(new_pcb, ttl);
+        // Generate new process only if we don't have a pending one
+        if (!pending_pcb) {
+            int new_pid = __sync_fetch_and_add(&pg->next_pid, 1);
+            pending_pcb = create_pcb(new_pid);
             
-            // Try to add to ready queue
-            if (enqueue_process(pg->ready_queue, new_pcb) == 0) {
-                __sync_fetch_and_add(&pg->total_generated, 1);
-                printf("[Process Generator] Created process PID=%d TTL=%d at tick %d (total=%d)\n", 
-                       new_pid, ttl, clk_counter, pg->total_generated);
-                fflush(stdout);
+            if (pending_pcb) {
+                // Set random TTL for the process
+                int ttl = pg->min_ttl;
+                if (pg->max_ttl > pg->min_ttl) {
+                    ttl += rand() % (pg->max_ttl - pg->min_ttl + 1);
+                }
+                set_pcb_ttl(pending_pcb, ttl);
             } else {
-                printf("[Process Generator] Ready queue full! Cannot create PID=%d\n", new_pid);
-                destroy_pcb(new_pcb);
+                printf("[Process Generator] Failed to allocate PCB for PID=%d\n", new_pid);
+                __sync_fetch_and_sub(&pg->next_pid, 1);
+                pthread_mutex_unlock(&clk_mutex);
+                continue;
             }
+        }
+        
+        // Try to add pending PCB to ready queue
+        int enqueue_result = enqueue_process(pg->ready_queue, pending_pcb);
+        if (enqueue_result == 0) {
+            // Successfully enqueued
+            __sync_fetch_and_add(&pg->total_generated, 1);
+            
+            // If we were waiting, indicate we resumed
+            if (waiting_for_space) {
+                printf("[Process Generator] Space available - resuming process generation\n");
+                fflush(stdout);
+                waiting_for_space = 0;
+            }
+            
+            printf("[Process Generator] Created process PID=%d TTL=%d (total=%d)\n", 
+                   pending_pcb->pid, pending_pcb->ttl, pg->total_generated);
+            fflush(stdout);
+            
+            // Clear pending PCB and calculate next generation time
+            pending_pcb = NULL;
+            interval = pg->min_interval;
+            if (pg->max_interval > pg->min_interval) {
+                interval += rand() % (pg->max_interval - pg->min_interval + 1);
+            }
+            next_generation_tick = clk_counter + interval;
         } else {
-            printf("[Process Generator] Failed to allocate PCB for PID=%d\n", new_pid);
+            // Queue is full - print message only once
+            if (!waiting_for_space) {
+                printf("[Process Generator] Ready queue full! Waiting for space...\n");
+                fflush(stdout);
+                waiting_for_space = 1;
+            }
+            // Keep pending_pcb for next attempt, don't update next_generation_tick
         }
-        
-        // Calculate next generation time with random interval
-        interval = pg->min_interval;
-        if (pg->max_interval > pg->min_interval) {
-            interval += rand() % (pg->max_interval - pg->min_interval + 1);
-        }
-        next_generation_tick = clk_counter + interval;
-        
-        printf("[Process Generator] Next process in %d ticks (at tick %d)\n", 
-               interval, next_generation_tick);
-        fflush(stdout);
         
         pthread_mutex_unlock(&clk_mutex);
+    }
+    
+    // Cleanup pending PCB if any
+    if (pending_pcb) {
+        destroy_pcb(pending_pcb);
     }
     
     printf("[Process Generator] Thread terminated\n");
@@ -202,7 +217,7 @@ void* process_generator_function(void* arg) {
 // Create a new process generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
                                           int min_ttl, int max_ttl,
-                                          int max_processes, ProcessQueue* ready_queue) {
+                                          ProcessQueue* ready_queue) {
     if (!ready_queue || min_interval < 1 || max_interval < min_interval || 
         min_ttl < 1 || max_ttl < min_ttl) {
         fprintf(stderr, "Invalid process generator parameters\n");
@@ -216,7 +231,6 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
     pg->max_interval = max_interval;
     pg->min_ttl = min_ttl;
     pg->max_ttl = max_ttl;
-    pg->max_processes = max_processes;
     pg->ready_queue = ready_queue;
     pg->running = 0;
     pg->next_pid = 1;  // PIDs start from 1
@@ -235,10 +249,9 @@ void start_process_generator(ProcessGenerator* pg) {
         fprintf(stderr, "Error creating process generator thread: %s\n", strerror(ret));
         pg->running = 0;
     } else {
-        printf("[Process Generator] Started (interval: %d-%d ticks, TTL: %d-%d, max: %s)\n",
+        printf("[Process Generator] Started (interval: %d-%d ticks, TTL: %d-%d)\n",
                pg->min_interval, pg->max_interval, 
-               pg->min_ttl, pg->max_ttl,
-               pg->max_processes > 0 ? "limited" : "unlimited");
+               pg->min_ttl, pg->max_ttl);
     }
 }
 
@@ -265,125 +278,147 @@ void destroy_process_generator(ProcessGenerator* pg) {
 }
 
 // ============================================================================
-// Process Manager
+// Scheduler with Quantum
 // ============================================================================
 
-// Process manager thread function - manages active processes and decrements TTL
-void* process_manager_function(void* arg) {
-    ProcessManager* pm = (ProcessManager*)arg;
+// Scheduler thread function - manages process execution with fixed quantum
+void* scheduler_function(void* arg) {
+    Scheduler* sched = (Scheduler*)arg;
     int last_tick = 0;
     
-    while (pm->running) {
+    while (sched->running) {
         pthread_mutex_lock(&clk_mutex);
         
         // Wait for next clock tick
-        while (pm->running && clk_counter == last_tick) {
+        while (sched->running && clk_counter == last_tick) {
             pthread_cond_wait(&clk_cond, &clk_mutex);
         }
         
-        if (!pm->running) {
+        if (!sched->running) {
             pthread_mutex_unlock(&clk_mutex);
             break;
         }
         
         last_tick = clk_counter;
         
-        // Process all active processes and decrement their TTL
-        int queue_size = pm->active_queue->current_size;
-        
-        for (int i = 0; i < queue_size; i++) {
-            // Dequeue process to check it
-            PCB* pcb = dequeue_process(pm->active_queue);
-            if (!pcb) break;
+        // If we have a running process, decrement its TTL
+        if (sched->current_process) {
+            int new_ttl = decrement_pcb_ttl(sched->current_process);
+            sched->quantum_counter++;
             
-            // Decrement TTL
-            int new_ttl = decrement_pcb_ttl(pcb);
+            printf("[Scheduler] Process PID=%d executing (TTL=%d, quantum=%d/%d)\n", 
+                   sched->current_process->pid, new_ttl, sched->quantum_counter, sched->quantum);
+            fflush(stdout);
             
+            // Check if process completed or quantum expired
             if (new_ttl <= 0) {
-                // Process has completed its TTL cycle
-                printf("[Process Manager] Process PID=%d COMPLETED (TTL expired) at tick %d\n", 
-                       pcb->pid, clk_counter);
+                // Process completed - destroy it
+                printf("[Scheduler] Process PID=%d COMPLETED - destroying\n", sched->current_process->pid);
                 fflush(stdout);
-                __sync_fetch_and_add(&pm->total_terminated, 1);
-                
-                // Reset TTL and return to ready queue
-                reset_pcb_ttl(pcb);
-                pcb->state = WAITING;
-                
-                if (pm->ready_queue && enqueue_process(pm->ready_queue, pcb) == 0) {
-                    printf("[Process Manager] Process PID=%d returned to READY queue (TTL reset to %d)\n", 
-                           pcb->pid, get_pcb_ttl(pcb));
-                    fflush(stdout);
-                } else {
-                    printf("[Process Manager] WARNING: Could not return PID=%d to ready queue, destroying\n", 
-                           pcb->pid);
-                    fflush(stdout);
-                    destroy_pcb(pcb);
-                }
-            } else {
-                // Process still alive, put it back in the queue
-                enqueue_process(pm->active_queue, pcb);
+                __sync_fetch_and_add(&sched->total_completed, 1);
+                destroy_pcb(sched->current_process);
+                sched->current_process = NULL;
+                sched->quantum_counter = 0;
+            } else if (sched->quantum_counter >= sched->quantum) {
+                // Quantum expired - return to ready queue
+                printf("[Scheduler] Process PID=%d quantum expired - moving to READY\n", 
+                       sched->current_process->pid);
+                fflush(stdout);
+                sched->current_process->state = WAITING;
+                enqueue_process(sched->ready_queue, sched->current_process);
+                sched->current_process = NULL;
+                sched->quantum_counter = 0;
             }
+        }
+        
+        // If no current process, try to get next one from ready queue
+        if (sched->current_process == NULL && sched->ready_queue->current_size > 0) {
+            sched->current_process = dequeue_process(sched->ready_queue);
+            if (sched->current_process) {
+                sched->current_process->state = RUNNING;
+                sched->quantum_counter = 0;
+                printf("[Scheduler] Process PID=%d selected for execution (TTL=%d)\n", 
+                       sched->current_process->pid, sched->current_process->ttl);
+                fflush(stdout);
+            }
+        }
+        
+        // If still no process, CPU is idle (wait for process generator)
+        if (sched->current_process == NULL) {
+            // Do nothing - just wait for next tick and check again
         }
         
         pthread_mutex_unlock(&clk_mutex);
     }
     
-    printf("[Process Manager] Thread terminated\n");
+    printf("[Scheduler] Thread terminated\n");
     return NULL;
 }
 
-// Create a new process manager
-ProcessManager* create_process_manager(ProcessQueue* active_queue, ProcessQueue* ready_queue) {
-    if (!active_queue || !ready_queue) {
-        fprintf(stderr, "Invalid process manager parameters\n");
+// Create a new scheduler
+Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, ProcessQueue* active_queue) {
+    if (!ready_queue || !active_queue || quantum < 1) {
+        fprintf(stderr, "Invalid scheduler parameters\n");
         return NULL;
     }
     
-    ProcessManager* pm = malloc(sizeof(ProcessManager));
-    if (!pm) return NULL;
+    Scheduler* sched = malloc(sizeof(Scheduler));
+    if (!sched) return NULL;
     
-    pm->active_queue = active_queue;
-    pm->ready_queue = ready_queue;
-    pm->running = 0;
-    pm->total_terminated = 0;
+    sched->quantum = quantum;
+    sched->ready_queue = ready_queue;
+    sched->active_queue = active_queue;
+    sched->running = 0;
+    sched->total_completed = 0;
+    sched->current_process = NULL;
+    sched->quantum_counter = 0;
     
-    return pm;
+    return sched;
 }
 
-// Start the process manager thread
-void start_process_manager(ProcessManager* pm) {
-    if (!pm || pm->running) return;
+// Start the scheduler thread
+void start_scheduler(Scheduler* sched) {
+    if (!sched || sched->running) return;
     
-    pm->running = 1;
-    int ret = pthread_create(&pm->thread, NULL, process_manager_function, pm);
+    sched->running = 1;
+    int ret = pthread_create(&sched->thread, NULL, scheduler_function, sched);
     if (ret != 0) {
-        fprintf(stderr, "Error creating process manager thread: %s\n", strerror(ret));
-        pm->running = 0;
+        fprintf(stderr, "Error creating scheduler thread: %s\n", strerror(ret));
+        sched->running = 0;
     } else {
-        printf("[Process Manager] Started\n");
+        printf("[Scheduler] Started with quantum=%d ticks\n", sched->quantum);
     }
 }
 
-// Stop the process manager thread
-void stop_process_manager(ProcessManager* pm) {
-    if (!pm) return;
+// Stop the scheduler thread
+void stop_scheduler(Scheduler* sched) {
+    if (!sched) return;
     
     pthread_mutex_lock(&clk_mutex);
-    pm->running = 0;
-    pthread_cond_broadcast(&clk_cond);  // Wake up the manager
+    sched->running = 0;
+    pthread_cond_broadcast(&clk_cond);  // Wake up the scheduler
     pthread_mutex_unlock(&clk_mutex);
     
-    pthread_join(pm->thread, NULL);
+    pthread_join(sched->thread, NULL);
 }
 
-// Destroy the process manager and free memory
-void destroy_process_manager(ProcessManager* pm) {
-    if (pm) {
-        if (pm->running) {
-            stop_process_manager(pm);
+// Destroy the scheduler and free memory
+void destroy_scheduler(Scheduler* sched) {
+    if (sched) {
+        if (sched->running) {
+            stop_scheduler(sched);
         }
-        free(pm);
+        free(sched);
     }
+}
+
+// Get and clear the current process from scheduler (for cleanup)
+PCB* scheduler_get_current_process(Scheduler* sched) {
+    if (!sched) return NULL;
+    
+    PCB* proc = sched->current_process;
+    sched->current_process = NULL;
+    sched->quantum_counter = 0;
+    return proc;
 }
 
