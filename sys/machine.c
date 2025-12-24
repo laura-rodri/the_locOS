@@ -8,6 +8,7 @@ Core* create_core(int num_kernel_threads) {
     if (!core) return NULL;
     
     core->num_kernel_threads = num_kernel_threads;
+    core->current_pcb_count = 0;
     core->pcbs = malloc(sizeof(PCB) * num_kernel_threads);
     if (!core->pcbs) {
         free(core);
@@ -18,7 +19,7 @@ Core* create_core(int num_kernel_threads) {
 }
 
 // Create a new CPU with given number of cores
-CPU* create_cpu(int num_cores) {
+CPU* create_cpu(int num_cores, int num_kernel_threads) {
     CPU* cpu = malloc(sizeof(CPU));
     if (!cpu) return NULL;
     
@@ -29,11 +30,27 @@ CPU* create_cpu(int num_cores) {
         return NULL;
     }
     
+    // Initialize each core
+    for (int i = 0; i < num_cores; i++) {
+        cpu->cores[i].num_kernel_threads = num_kernel_threads;
+        cpu->cores[i].current_pcb_count = 0;
+        cpu->cores[i].pcbs = malloc(sizeof(PCB) * num_kernel_threads);
+        if (!cpu->cores[i].pcbs) {
+            // Cleanup on failure
+            for (int j = 0; j < i; j++) {
+                free(cpu->cores[j].pcbs);
+            }
+            free(cpu->cores);
+            free(cpu);
+            return NULL;
+        }
+    }
+    
     return cpu;
 }
 
 // Create a new machine with given number of CPUs
-Machine* create_machine(int num_cpus) {
+Machine* create_machine(int num_cpus, int num_cores, int num_kernel_threads) {
     Machine* machine = malloc(sizeof(Machine));
     if (!machine) return NULL;
     
@@ -42,6 +59,47 @@ Machine* create_machine(int num_cpus) {
     if (!machine->cpus) {
         free(machine);
         return NULL;
+    }
+    
+    // Initialize each CPU
+    for (int i = 0; i < num_cpus; i++) {
+        machine->cpus[i].num_cores = num_cores;
+        machine->cpus[i].cores = malloc(sizeof(Core) * num_cores);
+        if (!machine->cpus[i].cores) {
+            // Cleanup on failure
+            for (int j = 0; j < i; j++) {
+                for (int k = 0; k < machine->cpus[j].num_cores; k++) {
+                    free(machine->cpus[j].cores[k].pcbs);
+                }
+                free(machine->cpus[j].cores);
+            }
+            free(machine->cpus);
+            free(machine);
+            return NULL;
+        }
+        
+        // Initialize each core in this CPU
+        for (int j = 0; j < num_cores; j++) {
+            machine->cpus[i].cores[j].num_kernel_threads = num_kernel_threads;
+            machine->cpus[i].cores[j].current_pcb_count = 0;
+            machine->cpus[i].cores[j].pcbs = malloc(sizeof(PCB) * num_kernel_threads);
+            if (!machine->cpus[i].cores[j].pcbs) {
+                // Cleanup on failure
+                for (int k = 0; k < j; k++) {
+                    free(machine->cpus[i].cores[k].pcbs);
+                }
+                free(machine->cpus[i].cores);
+                for (int k = 0; k < i; k++) {
+                    for (int l = 0; l < machine->cpus[k].num_cores; l++) {
+                        free(machine->cpus[k].cores[l].pcbs);
+                    }
+                    free(machine->cpus[k].cores);
+                }
+                free(machine->cpus);
+                free(machine);
+                return NULL;
+            }
+        }
     }
     
     return machine;
@@ -70,9 +128,87 @@ void destroy_cpu(CPU* cpu) {
 void destroy_machine(Machine* machine) {
     if (machine) {
         for (int i = 0; i < machine->num_CPUs; i++) {
-            destroy_cpu(&machine->cpus[i]);
+            // Free cores' PCB arrays
+            for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+                free(machine->cpus[i].cores[j].pcbs);
+            }
+            free(machine->cpus[i].cores);
         }
         free(machine->cpus);
         free(machine);
     }
+}
+
+// Check if any CPU can execute a process (has at least one core with available space)
+int can_cpu_execute_process(Machine* machine) {
+    if (!machine) return 0;
+    
+    for (int i = 0; i < machine->num_CPUs; i++) {
+        for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+            Core* core = &machine->cpus[i].cores[j];
+            if (core->current_pcb_count < core->num_kernel_threads) {
+                return 1;  // Found a core with available space
+            }
+        }
+    }
+    
+    return 0;  // No core has available space
+}
+
+// Assign a process to the first available kernel thread in any core
+// Returns 1 if successful, 0 if no space available
+int assign_process_to_core(Machine* machine, PCB* pcb) {
+    if (!machine || !pcb) return 0;
+    
+    for (int i = 0; i < machine->num_CPUs; i++) {
+        for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+            Core* core = &machine->cpus[i].cores[j];
+            if (core->current_pcb_count < core->num_kernel_threads) {
+                // Found available space - assign the process
+                core->pcbs[core->current_pcb_count] = *pcb;
+                core->current_pcb_count++;
+                return 1;
+            }
+        }
+    }
+    
+    return 0;  // No space available
+}
+
+// Remove a completed or expired process from cores
+// Returns 1 if found and removed, 0 otherwise
+int remove_process_from_core(Machine* machine, int pid) {
+    if (!machine) return 0;
+    
+    for (int i = 0; i < machine->num_CPUs; i++) {
+        for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+            Core* core = &machine->cpus[i].cores[j];
+            for (int k = 0; k < core->current_pcb_count; k++) {
+                if (core->pcbs[k].pid == pid) {
+                    // Found the process - remove it by shifting
+                    for (int l = k; l < core->current_pcb_count - 1; l++) {
+                        core->pcbs[l] = core->pcbs[l + 1];
+                    }
+                    core->current_pcb_count--;
+                    return 1;
+                }
+            }
+        }
+    }
+    
+    return 0;  // Process not found
+}
+
+// Count total number of processes currently executing in machine
+int count_executing_processes(Machine* machine) {
+    if (!machine) return 0;
+    
+    int count = 0;
+    for (int i = 0; i < machine->num_CPUs; i++) {
+        for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+            count += machine->cpus[i].cores[j].current_pcb_count;
+        }
+    }
+    
+    return count;
 }

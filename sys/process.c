@@ -1,5 +1,6 @@
 #include "process.h"
 #include "clock_sys.h"
+#include "machine.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -19,6 +20,7 @@ PCB* create_pcb(int pid) {
     pcb->priority = 0;     // Default priority
     pcb->ttl = 0;          // Default time to live
     pcb->initial_ttl = 0;  // Default initial TTL
+    pcb->quantum_counter = 0; // Initialize quantum counter
     
     return pcb;
 }
@@ -148,6 +150,23 @@ void* process_generator_function(void* arg) {
             break;
         }
         
+        // Calculate current total processes (ready queue + executing)
+        int executing_count = pg->machine ? count_executing_processes(pg->machine) : 0;
+        int total_processes = pg->ready_queue->current_size + executing_count;
+        
+        // Check if we have space for new process
+        if (total_processes >= pg->max_processes) {
+            // No space available
+            if (!waiting_for_space) {
+                printf("[Process Generator] Maximum process limit reached (%d/%d)! Waiting for space...\n",
+                       total_processes, pg->max_processes);
+                fflush(stdout);
+                waiting_for_space = 1;
+            }
+            pthread_mutex_unlock(&clk_mutex);
+            continue;
+        }
+        
         // Generate new process only if we don't have a pending one
         if (!pending_pcb) {
             int new_pid = __sync_fetch_and_add(&pg->next_pid, 1);
@@ -181,8 +200,9 @@ void* process_generator_function(void* arg) {
                 waiting_for_space = 0;
             }
             
-            printf("[Process Generator] Created process PID=%d TTL=%d (total=%d)\n", 
-                   pending_pcb->pid, pending_pcb->ttl, pg->total_generated);
+            printf("[Process Generator] Created process PID=%d TTL=%d (total=%d, in_system=%d/%d)\n", 
+                   pending_pcb->pid, pending_pcb->ttl, pg->total_generated, 
+                   total_processes + 1, pg->max_processes);
             fflush(stdout);
             
             // Clear pending PCB and calculate next generation time
@@ -217,9 +237,10 @@ void* process_generator_function(void* arg) {
 // Create a new process generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
                                           int min_ttl, int max_ttl,
-                                          ProcessQueue* ready_queue) {
+                                          ProcessQueue* ready_queue,
+                                          Machine* machine, int max_processes) {
     if (!ready_queue || min_interval < 1 || max_interval < min_interval || 
-        min_ttl < 1 || max_ttl < min_ttl) {
+        min_ttl < 1 || max_ttl < min_ttl || max_processes < 1) {
         fprintf(stderr, "Invalid process generator parameters\n");
         return NULL;
     }
@@ -232,6 +253,8 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
     pg->min_ttl = min_ttl;
     pg->max_ttl = max_ttl;
     pg->ready_queue = ready_queue;
+    pg->machine = machine;
+    pg->max_processes = max_processes;
     pg->running = 0;
     pg->next_pid = 1;  // PIDs start from 1
     pg->total_generated = 0;
@@ -301,51 +324,86 @@ void* scheduler_function(void* arg) {
         
         last_tick = clk_counter;
         
-        // If we have a running process, decrement its TTL
-        if (sched->current_process) {
-            int new_ttl = decrement_pcb_ttl(sched->current_process);
-            sched->quantum_counter++;
-            
-            printf("[Scheduler] Process PID=%d executing (TTL=%d, quantum=%d/%d)\n", 
-                   sched->current_process->pid, new_ttl, sched->quantum_counter, sched->quantum);
-            fflush(stdout);
-            
-            // Check if process completed or quantum expired
-            if (new_ttl <= 0) {
-                // Process completed - destroy it
-                printf("[Scheduler] Process PID=%d COMPLETED - destroying\n", sched->current_process->pid);
-                fflush(stdout);
-                __sync_fetch_and_add(&sched->total_completed, 1);
-                destroy_pcb(sched->current_process);
-                sched->current_process = NULL;
-                sched->quantum_counter = 0;
-            } else if (sched->quantum_counter >= sched->quantum) {
-                // Quantum expired - return to ready queue
-                printf("[Scheduler] Process PID=%d quantum expired - moving to READY\n", 
-                       sched->current_process->pid);
-                fflush(stdout);
-                sched->current_process->state = WAITING;
-                enqueue_process(sched->ready_queue, sched->current_process);
-                sched->current_process = NULL;
-                sched->quantum_counter = 0;
+        // Process all currently executing processes in all cores
+        if (sched->machine) {
+            for (int i = 0; i < sched->machine->num_CPUs; i++) {
+                for (int j = 0; j < sched->machine->cpus[i].num_cores; j++) {
+                    Core* core = &sched->machine->cpus[i].cores[j];
+                    
+                    // Process each PCB in this core (iterate backwards to safely remove)
+                    for (int k = core->current_pcb_count - 1; k >= 0; k--) {
+                        PCB* pcb = &core->pcbs[k];
+                        
+                        // Decrement TTL and increment quantum counter
+                        int new_ttl = decrement_pcb_ttl(pcb);
+                        pcb->quantum_counter++;
+                        
+                        printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d executing (TTL=%d, quantum=%d/%d)\n", 
+                               i, j, k, pcb->pid, new_ttl, pcb->quantum_counter, sched->quantum);
+                        fflush(stdout);
+                        
+                        // Check if process completed or quantum expired
+                        if (new_ttl <= 0) {
+                            // Process completed
+                            printf("[Scheduler] Process PID=%d COMPLETED - removing from CPU%d-Core%d-Thread%d\n", 
+                                   pcb->pid, i, j, k);
+                            fflush(stdout);
+                            __sync_fetch_and_add(&sched->total_completed, 1);
+                            
+                            // Remove from core by shifting
+                            for (int l = k; l < core->current_pcb_count - 1; l++) {
+                                core->pcbs[l] = core->pcbs[l + 1];
+                            }
+                            core->current_pcb_count--;
+                            
+                        } else if (pcb->quantum_counter >= sched->quantum) {
+                            // Quantum expired - return to ready queue
+                            printf("[Scheduler] Process PID=%d quantum expired - moving from CPU%d-Core%d-Thread%d to READY\n", 
+                                   pcb->pid, i, j, k);
+                            fflush(stdout);
+                            
+                            // Create a copy for the ready queue
+                            PCB* ready_pcb = create_pcb(pcb->pid);
+                            if (ready_pcb) {
+                                ready_pcb->state = WAITING;
+                                ready_pcb->priority = pcb->priority;
+                                ready_pcb->ttl = pcb->ttl;
+                                ready_pcb->initial_ttl = pcb->initial_ttl;
+                                ready_pcb->quantum_counter = 0;  // Reset quantum counter
+                                enqueue_process(sched->ready_queue, ready_pcb);
+                            }
+                            
+                            // Remove from core
+                            for (int l = k; l < core->current_pcb_count - 1; l++) {
+                                core->pcbs[l] = core->pcbs[l + 1];
+                            }
+                            core->current_pcb_count--;
+                        }
+                    }
+                }
             }
         }
         
-        // If no current process, try to get next one from ready queue
-        if (sched->current_process == NULL && sched->ready_queue->current_size > 0) {
-            sched->current_process = dequeue_process(sched->ready_queue);
-            if (sched->current_process) {
-                sched->current_process->state = RUNNING;
-                sched->quantum_counter = 0;
-                printf("[Scheduler] Process PID=%d selected for execution (TTL=%d)\n", 
-                       sched->current_process->pid, sched->current_process->ttl);
-                fflush(stdout);
+        // Try to assign processes from ready queue to available cores
+        while (sched->ready_queue->current_size > 0 && can_cpu_execute_process(sched->machine)) {
+            PCB* pcb = dequeue_process(sched->ready_queue);
+            if (pcb) {
+                pcb->state = RUNNING;
+                pcb->quantum_counter = 0;  // Reset quantum counter for new execution
+                
+                if (assign_process_to_core(sched->machine, pcb)) {
+                    printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d)\n", 
+                           pcb->pid, pcb->ttl);
+                    fflush(stdout);
+                    
+                    // Free the original PCB since assign_process_to_core makes a copy
+                    destroy_pcb(pcb);
+                } else {
+                    // Couldn't assign - put back in queue
+                    enqueue_process(sched->ready_queue, pcb);
+                    break;
+                }
             }
-        }
-        
-        // If still no process, CPU is idle (wait for process generator)
-        if (sched->current_process == NULL) {
-            // Do nothing - just wait for next tick and check again
         }
         
         pthread_mutex_unlock(&clk_mutex);
@@ -356,8 +414,8 @@ void* scheduler_function(void* arg) {
 }
 
 // Create a new scheduler
-Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, ProcessQueue* active_queue) {
-    if (!ready_queue || !active_queue || quantum < 1) {
+Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, Machine* machine) {
+    if (!ready_queue || quantum < 1) {
         fprintf(stderr, "Invalid scheduler parameters\n");
         return NULL;
     }
@@ -367,11 +425,9 @@ Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, ProcessQueue
     
     sched->quantum = quantum;
     sched->ready_queue = ready_queue;
-    sched->active_queue = active_queue;
+    sched->machine = machine;
     sched->running = 0;
     sched->total_completed = 0;
-    sched->current_process = NULL;
-    sched->quantum_counter = 0;
     
     return sched;
 }
@@ -411,14 +467,3 @@ void destroy_scheduler(Scheduler* sched) {
         free(sched);
     }
 }
-
-// Get and clear the current process from scheduler (for cleanup)
-PCB* scheduler_get_current_process(Scheduler* sched) {
-    if (!sched) return NULL;
-    
-    PCB* proc = sched->current_process;
-    sched->current_process = NULL;
-    sched->quantum_counter = 0;
-    return proc;
-}
-

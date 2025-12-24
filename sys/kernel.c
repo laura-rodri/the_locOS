@@ -15,7 +15,7 @@ static int num_timers_global = 0;
 static ProcessGenerator* proc_gen_global = NULL;
 static Scheduler* scheduler_global = NULL;
 static ProcessQueue* ready_queue_global = NULL;
-static ProcessQueue* active_queue_global = NULL;
+static Machine* machine_global = NULL;
 static volatile int running = 1;  // Flag to control main loop
 
 // Clean up system resources
@@ -23,20 +23,36 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
     printf("Stopping scheduler...\n");
     fflush(stdout);
     
-    // Stop scheduler and get current process if any
-    PCB* current_proc = NULL;
+    // Stop scheduler and print all running processes
     if (scheduler_global) {
         stop_scheduler(scheduler_global);
-        current_proc = scheduler_get_current_process(scheduler_global);
         
-        if (current_proc) {
-            printf("\tCurrent running process: PID=%d (TTL=%d)\n", 
-                   current_proc->pid, current_proc->ttl);
-            fflush(stdout);
+        // Print all processes currently executing in the machine
+        if (machine_global) {
+            int total_executing = count_executing_processes(machine_global);
+            printf("\tTotal processes executing: %d\n", total_executing);
+            
+            if (total_executing > 0) {
+                printf("\tProcesses by CPU, Core, and Kernel Thread:\n");
+                for (int i = 0; i < machine_global->num_CPUs; i++) {
+                    for (int j = 0; j < machine_global->cpus[i].num_cores; j++) {
+                        Core* core = &machine_global->cpus[i].cores[j];
+                        if (core->current_pcb_count > 0) {
+                            printf("\t  CPU%d - Core%d (%d/%d threads used):\n", 
+                                   i, j, core->current_pcb_count, core->num_kernel_threads);
+                            for (int k = 0; k < core->current_pcb_count; k++) {
+                                PCB* pcb = &core->pcbs[k];
+                                printf("\t    Thread%d: PID=%d (TTL=%d, State=%d, Quantum=%d)\n", 
+                                       k, pcb->pid, pcb->ttl, pcb->state, pcb->quantum_counter);
+                            }
+                        }
+                    }
+                }
+            }
         } else {
-            printf("\tNo process was running\n");
-            fflush(stdout);
+            printf("\tNo processes were running\n");
         }
+        fflush(stdout);
         
         destroy_scheduler(scheduler_global);
     }
@@ -93,37 +109,11 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         destroy_process_queue(ready_queue_global);
     }
     
-    printf("Cleaning active queue...\n");
-    fflush(stdout);
-    // Clean up active queue and remaining processes
-    if (active_queue_global) {
-        printf("\tNumber of processes: %d\n", active_queue_global->current_size);
-        if (active_queue_global->current_size > 0) {
-            printf("\tProcess IDs: ");
-            int count = active_queue_global->current_size;
-            int idx = active_queue_global->front;
-            for (int i = 0; i < count; i++) {
-                PCB* pcb = (PCB*)active_queue_global->queue[idx];
-                printf("%d ", pcb->pid);
-                idx = (idx + 1) % active_queue_global->max_capacity;
-            }
-            printf("\n");
-        }
+    // Destroy machine (processes in cores are not dynamically allocated, just struct copies)
+    if (machine_global) {
+        printf("Destroying machine...\n");
         fflush(stdout);
-        
-        PCB* pcb;
-        while ((pcb = dequeue_process(active_queue_global)) != NULL) {
-            destroy_pcb(pcb);
-        }
-        destroy_process_queue(active_queue_global);
-    }
-    
-    // Destroy current process from scheduler if it exists
-    if (current_proc) {
-        printf("Cleaning scheduler's current process...\n");
-        printf("\tDestroying process PID=%d\n", current_proc->pid);
-        fflush(stdout);
-        destroy_pcb(current_proc);
+        destroy_machine(machine_global);
     }
     
     printf("Destroying mutexes...\n");
@@ -145,6 +135,9 @@ int main(int argc, char *argv[]) {
     int proc_ttl_min = 10;        // Default min TTL for processes (ticks)
     int proc_ttl_max = 50;        // Default max TTL for processes (ticks)
     int ready_queue_size = 100;   // Default ready queue capacity
+    int num_cpus = 1;             // Default number of CPUs
+    int num_cores = 2;            // Default number of cores per CPU
+    int num_threads = 4;          // Default number of kernel threads per core
     
     // Parse command line arguments
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
@@ -157,6 +150,9 @@ int main(int argc, char *argv[]) {
         printf("   -tmin <ticks>     Min TTL for processes in ticks (default: 10)\n");
         printf("   -tmax <ticks>     Max TTL for processes in ticks (default: 50)\n");
         printf("   -qsize <num>      Ready queue size (default: 100)\n");
+        printf("   -cpus <num>       Number of CPUs (default: 1)\n");
+        printf("   -cores <num>      Number of cores per CPU (default: 2)\n");
+        printf("   -threads <num>    Number of kernel threads per core (default: 4)\n");
         return 0;
     }
 
@@ -184,6 +180,15 @@ int main(int argc, char *argv[]) {
                 } else if (strcmp(argv[i], "-qsize")==0) {
                     i++;
                     ready_queue_size = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 100;
+                } else if (strcmp(argv[i], "-cpus")==0) {
+                    i++;
+                    num_cpus = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 1;
+                } else if (strcmp(argv[i], "-cores")==0) {
+                    i++;
+                    num_cores = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 2;
+                } else if (strcmp(argv[i], "-threads")==0) {
+                    i++;
+                    num_threads = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 4;
                 }
             }
         }
@@ -212,21 +217,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Create active queue for processes
-    active_queue_global = create_process_queue(ready_queue_size);
-    if (!active_queue_global) {
-        fprintf(stderr, "Failed to create active queue\n");
+    // Create machine with CPUs, cores, and kernel threads
+    machine_global = create_machine(num_cpus, num_cores, num_threads);
+    if (!machine_global) {
+        fprintf(stderr, "Failed to create machine\n");
         destroy_process_queue(ready_queue_global);
         stop_clock(clk_thread);
         return 1;
     }
     
-    // Create process generator
+    // Calculate maximum usable kernel threads (limited by qsize)
+    int total_threads = num_cpus * num_cores * num_threads;
+    int max_usable_threads = (total_threads < ready_queue_size) ? total_threads : ready_queue_size;
+    
+    // Create process generator with machine reference and max_processes limit
     proc_gen_global = create_process_generator(proc_gen_min, proc_gen_max, 
                                                proc_ttl_min, proc_ttl_max,
-                                               ready_queue_global);
+                                               ready_queue_global, machine_global, 
+                                               ready_queue_size);
     if (!proc_gen_global) {
         fprintf(stderr, "Failed to create process generator\n");
+        destroy_machine(machine_global);
         destroy_process_queue(ready_queue_global);
         stop_clock(clk_thread);
         return 1;
@@ -235,13 +246,13 @@ int main(int argc, char *argv[]) {
     // Start process generator
     start_process_generator(proc_gen_global);
     
-    // Create scheduler with quantum
-    scheduler_global = create_scheduler(quantum, ready_queue_global, active_queue_global);
+    // Create scheduler with quantum and machine
+    scheduler_global = create_scheduler(quantum, ready_queue_global, machine_global);
     if (!scheduler_global) {
         fprintf(stderr, "Failed to create scheduler\n");
         stop_process_generator(proc_gen_global);
         destroy_process_generator(proc_gen_global);
-        destroy_process_queue(active_queue_global);
+        destroy_machine(machine_global);
         destroy_process_queue(ready_queue_global);
         stop_clock(clk_thread);
         return 1;
@@ -255,7 +266,14 @@ int main(int argc, char *argv[]) {
     printf("Scheduler quantum:    %d ticks\n", quantum);
     printf("Process gen interval: %d-%d ticks\n", proc_gen_min, proc_gen_max);
     printf("Process TTL range:    %d-%d ticks\n", proc_ttl_min, proc_ttl_max);
-    printf("Ready queue size:     %d (max processes)\n============================\n", ready_queue_size);
+    printf("Max processes:        %d (queue size limit)\n", ready_queue_size);
+    printf("Machine topology:\n");
+    printf("  - CPUs:             %d\n", num_cpus);
+    printf("  - Cores per CPU:    %d\n", num_cores);
+    printf("  - Threads per core: %d\n", num_threads);
+    printf("  - Total threads:    %d\n", total_threads);
+    printf("  - Usable threads:   %d (limited by max_processes)\n", max_usable_threads);
+    printf("============================\n");
     printf("\nPress Ctrl+C to exit...\n\n");
     
     // Wait for signal using pause() which will be interrupted by SIGINT

@@ -3,6 +3,9 @@
 
 #include <pthread.h>
 
+// Forward declaration for Machine
+typedef struct Machine Machine;
+
 // Process states
 #define RUNNING 0
 #define WAITING 1
@@ -15,6 +18,7 @@ typedef struct {
     int priority;
     int ttl;            // Time to live (current)
     int initial_ttl;    // Initial TTL value (for reset)
+    int quantum_counter; // Current quantum usage
     // etc - extend as needed
 } PCB;
 
@@ -34,6 +38,8 @@ typedef struct {
     int min_ttl;             // Minimum time to live for processes
     int max_ttl;             // Maximum time to live for processes
     ProcessQueue* ready_queue; // Queue where new processes are added
+    Machine* machine;        // Machine to check executing processes
+    int max_processes;       // Maximum total processes (ready + executing)
     pthread_t thread;        // Generator thread
     volatile int running;    // Flag to control generator execution
     volatile int next_pid;   // Next process ID to assign
@@ -44,12 +50,10 @@ typedef struct {
 typedef struct {
     int quantum;                     // Quantum (max ticks per process)
     ProcessQueue* ready_queue;       // Queue of ready processes
-    ProcessQueue* active_queue;      // Queue with current running process (max 1)
+    Machine* machine;                // Machine with CPUs and cores
     pthread_t thread;                // Scheduler thread
     volatile int running;            // Flag to control scheduler execution
     volatile int total_completed;    // Total processes completed
-    PCB* current_process;            // Currently executing process
-    int quantum_counter;             // Current quantum counter
 } Scheduler;
 
 // PCB management
@@ -70,18 +74,18 @@ PCB* dequeue_process(ProcessQueue* pq);
 // Process Generator
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
                                            int min_ttl, int max_ttl,
-                                           ProcessQueue* ready_queue);
+                                           ProcessQueue* ready_queue,
+                                           Machine* machine, int max_processes);
 void start_process_generator(ProcessGenerator* pg);
 void stop_process_generator(ProcessGenerator* pg);
 void destroy_process_generator(ProcessGenerator* pg);
 void* process_generator_function(void* arg);
 
 // Scheduler with quantum
-Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, ProcessQueue* active_queue);
+Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, Machine* machine);
 void start_scheduler(Scheduler* sched);
 void stop_scheduler(Scheduler* sched);
 void destroy_scheduler(Scheduler* sched);
 void* scheduler_function(void* arg);
-PCB* scheduler_get_current_process(Scheduler* sched);  // Get and clear current process
 
 #endif // PROCESS_H
