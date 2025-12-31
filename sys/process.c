@@ -304,6 +304,92 @@ void destroy_process_generator(ProcessGenerator* pg) {
 // Scheduler with Quantum
 // ============================================================================
 
+// Helper function: Select next process based on policy
+static PCB* select_next_process(Scheduler* sched) {
+    if (sched->ready_queue->current_size == 0) {
+        return NULL;
+    }
+    
+    switch (sched->policy) {
+        case SCHED_POLICY_ROUND_ROBIN:
+            // Simple FIFO - dequeue from front
+            return dequeue_process(sched->ready_queue);
+            
+        case SCHED_POLICY_BFS: {
+            // Brain Fuck Scheduler - select process with lowest PID
+            int min_pid = -1;
+            int min_idx = -1;
+            int idx = sched->ready_queue->front;
+            
+            for (int i = 0; i < sched->ready_queue->current_size; i++) {
+                PCB* pcb = (PCB*)sched->ready_queue->queue[idx];
+                if (min_pid == -1 || pcb->pid < min_pid) {
+                    min_pid = pcb->pid;
+                    min_idx = idx;
+                }
+                idx = (idx + 1) % sched->ready_queue->max_capacity;
+            }
+            
+            if (min_idx == -1) return NULL;
+            
+            // Remove selected process from queue
+            PCB* selected = (PCB*)sched->ready_queue->queue[min_idx];
+            
+            // Shift elements to fill the gap
+            int current_idx = min_idx;
+            for (int i = 0; i < sched->ready_queue->current_size - 1; i++) {
+                int next_idx = (current_idx + 1) % sched->ready_queue->max_capacity;
+                sched->ready_queue->queue[current_idx] = sched->ready_queue->queue[next_idx];
+                current_idx = next_idx;
+            }
+            
+            sched->ready_queue->current_size--;
+            sched->ready_queue->rear = (sched->ready_queue->rear - 1 + sched->ready_queue->max_capacity) 
+                                       % sched->ready_queue->max_capacity;
+            
+            return selected;
+        }
+            
+        case SCHED_POLICY_PREEMPTIVE_PRIO: {
+            // Preemptive with static priorities - select highest priority (lowest number)
+            int max_prio = -1;
+            int max_idx = -1;
+            int idx = sched->ready_queue->front;
+            
+            for (int i = 0; i < sched->ready_queue->current_size; i++) {
+                PCB* pcb = (PCB*)sched->ready_queue->queue[idx];
+                if (max_prio == -1 || pcb->priority < max_prio) {
+                    max_prio = pcb->priority;
+                    max_idx = idx;
+                }
+                idx = (idx + 1) % sched->ready_queue->max_capacity;
+            }
+            
+            if (max_idx == -1) return NULL;
+            
+            // Remove selected process from queue
+            PCB* selected = (PCB*)sched->ready_queue->queue[max_idx];
+            
+            // Shift elements to fill the gap
+            int current_idx = max_idx;
+            for (int i = 0; i < sched->ready_queue->current_size - 1; i++) {
+                int next_idx = (current_idx + 1) % sched->ready_queue->max_capacity;
+                sched->ready_queue->queue[current_idx] = sched->ready_queue->queue[next_idx];
+                current_idx = next_idx;
+            }
+            
+            sched->ready_queue->current_size--;
+            sched->ready_queue->rear = (sched->ready_queue->rear - 1 + sched->ready_queue->max_capacity) 
+                                       % sched->ready_queue->max_capacity;
+            
+            return selected;
+        }
+            
+        default:
+            return dequeue_process(sched->ready_queue);
+    }
+}
+
 // Scheduler thread function - manages process execution with fixed quantum
 void* scheduler_function(void* arg) {
     Scheduler* sched = (Scheduler*)arg;
@@ -386,14 +472,14 @@ void* scheduler_function(void* arg) {
         
         // Try to assign processes from ready queue to available cores
         while (sched->ready_queue->current_size > 0 && can_cpu_execute_process(sched->machine)) {
-            PCB* pcb = dequeue_process(sched->ready_queue);
+            PCB* pcb = select_next_process(sched);
             if (pcb) {
                 pcb->state = RUNNING;
                 pcb->quantum_counter = 0;  // Reset quantum counter for new execution
                 
                 if (assign_process_to_core(sched->machine, pcb)) {
-                    printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d)\n", 
-                           pcb->pid, pcb->ttl);
+                    printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d, Priority=%d)\n", 
+                           pcb->pid, pcb->ttl, pcb->priority);
                     fflush(stdout);
                     
                     // Free the original PCB since assign_process_to_core makes a copy
@@ -413,10 +499,36 @@ void* scheduler_function(void* arg) {
     return NULL;
 }
 
-// Create a new scheduler
+// Create a new scheduler with default policy (Round Robin, clock sync)
 Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, Machine* machine) {
+    return create_scheduler_with_policy(quantum, SCHED_POLICY_ROUND_ROBIN, 
+                                       SCHED_SYNC_CLOCK, NULL, ready_queue, machine);
+}
+
+// Create a new scheduler with specific policy and synchronization
+Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode, 
+                                       void* sync_source, ProcessQueue* ready_queue, 
+                                       Machine* machine) {
     if (!ready_queue || quantum < 1) {
         fprintf(stderr, "Invalid scheduler parameters\n");
+        return NULL;
+    }
+    
+    // Validate policy
+    if (policy < SCHED_POLICY_ROUND_ROBIN || policy > SCHED_POLICY_PREEMPTIVE_PRIO) {
+        fprintf(stderr, "Invalid scheduler policy: %d\n", policy);
+        return NULL;
+    }
+    
+    // Validate sync mode
+    if (sync_mode < SCHED_SYNC_CLOCK || sync_mode > SCHED_SYNC_TIMER) {
+        fprintf(stderr, "Invalid scheduler sync mode: %d\n", sync_mode);
+        return NULL;
+    }
+    
+    // If using timer sync, sync_source must be provided
+    if (sync_mode == SCHED_SYNC_TIMER && !sync_source) {
+        fprintf(stderr, "Timer sync mode requires a valid Timer pointer\n");
         return NULL;
     }
     
@@ -424,6 +536,9 @@ Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, Machine* mac
     if (!sched) return NULL;
     
     sched->quantum = quantum;
+    sched->policy = policy;
+    sched->sync_mode = sync_mode;
+    sched->sync_source = sync_source;
     sched->ready_queue = ready_queue;
     sched->machine = machine;
     sched->running = 0;
@@ -442,7 +557,13 @@ void start_scheduler(Scheduler* sched) {
         fprintf(stderr, "Error creating scheduler thread: %s\n", strerror(ret));
         sched->running = 0;
     } else {
-        printf("[Scheduler] Started with quantum=%d ticks\n", sched->quantum);
+        const char* policy_names[] = {"Round Robin", "BFS", "Preemptive Priority"};
+        const char* sync_names[] = {"Global Clock", "Timer"};
+        
+        printf("[Scheduler] Started with:\n");
+        printf("  - Quantum: %d ticks\n", sched->quantum);
+        printf("  - Policy: %s\n", policy_names[sched->policy]);
+        printf("  - Sync: %s\n", sync_names[sched->sync_mode]);
     }
 }
 

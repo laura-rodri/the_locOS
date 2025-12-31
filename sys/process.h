@@ -46,9 +46,21 @@ typedef struct {
     volatile int total_generated; // Total processes generated
 } ProcessGenerator;
 
+// Scheduler policies
+#define SCHED_POLICY_ROUND_ROBIN 0      // Round robin sin prioridades (default)
+#define SCHED_POLICY_BFS 1              // Brain Fuck Scheduler
+#define SCHED_POLICY_PREEMPTIVE_PRIO 2  // Expulsora por evento con prioridades estáticas
+
+// Scheduler synchronization modes
+#define SCHED_SYNC_CLOCK 0    // Sincronizado con el reloj global
+#define SCHED_SYNC_TIMER 1    // Sincronizado con un timer
+
 // Scheduler configuration
 typedef struct {
     int quantum;                     // Quantum (max ticks per process)
+    int policy;                      // Política de planificación
+    int sync_mode;                   // Modo de sincronización (CLOCK o TIMER)
+    void* sync_source;               // Timer* si sync_mode==TIMER, NULL si CLOCK
     ProcessQueue* ready_queue;       // Queue of ready processes
     Machine* machine;                // Machine with CPUs and cores
     pthread_t thread;                // Scheduler thread
@@ -83,6 +95,9 @@ void* process_generator_function(void* arg);
 
 // Scheduler with quantum
 Scheduler* create_scheduler(int quantum, ProcessQueue* ready_queue, Machine* machine);
+Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode, 
+                                        void* sync_source, ProcessQueue* ready_queue, 
+                                        Machine* machine);
 void start_scheduler(Scheduler* sched);
 void stop_scheduler(Scheduler* sched);
 void destroy_scheduler(Scheduler* sched);
