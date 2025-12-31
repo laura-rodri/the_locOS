@@ -22,16 +22,34 @@ El sistema soporta tres políticas de planificación:
 - Los procesos se ejecutan en orden FIFO (First In, First Out)
 - Cada proceso recibe un quantum de tiempo de CPU
 - Cuando expira el quantum, el proceso vuelve al final de la cola de listos
+- Utiliza una única cola de preparados
 
 #### 2. Brain Fuck Scheduler (SCHED_POLICY_BFS = 1)
-- Selecciona siempre el proceso con el PID más bajo
-- Útil para pruebas y depuración
-- Comportamiento determinista y predecible
+- Selecciona siempre el proceso con la **virtual deadline más baja**
+- Asigna rodajas de tiempo de ejecución fijas (quantum configurable)
+- La virtual deadline se calcula: `deadline = T_actual + offset`
+  - `T_actual`: número de ticks actual
+  - `offset = rodaja_de_tiempo * prioridad / 100`
+- Procesos con mayor prioridad (números negativos) obtienen deadlines más tempranas
+- Útil para dar prioridad implícita a procesos sin usar colas separadas
+- Utiliza una única cola de preparados
 
 #### 3. Política Expulsora con Prioridades Estáticas (SCHED_POLICY_PREEMPTIVE_PRIO = 2)
-- Los procesos tienen prioridades estáticas
-- Siempre se ejecuta el proceso con mayor prioridad (número más bajo = mayor prioridad)
-- Política expulsora: un proceso de mayor prioridad puede interrumpir a uno de menor prioridad
+- Utiliza **múltiples colas de preparados**, una por cada nivel de prioridad
+- Las prioridades van de **-20 (mayor prioridad) a +19 (menor prioridad)**
+- Total de 40 niveles de prioridad
+- Siempre se ejecuta el primer proceso de la cola de mayor prioridad
+- **Política expulsora por evento**: 
+  - **Por Prioridades**: Cada proceso tiene un número que indica su importancia
+  - **Expulsora (Preemptive)**: Un proceso de alta prioridad puede detener forzosamente (expulsar) a uno de menor prioridad
+  - **Por Evento (Event-Driven)**: El planificador se activa cuando ocurre un evento:
+    - Llegada de un nuevo proceso de alta prioridad
+    - Terminación de un proceso
+    - Fin de quantum de un proceso
+    - Interrupción del timer
+- Cuando llega un proceso de alta prioridad y no hay slots libres, **expulsa inmediatamente** al proceso de menor prioridad en ejecución
+- Cada cola usa FIFO para procesos del mismo nivel de prioridad
+- Garantiza que procesos críticos (-20) tengan prioridad absoluta sobre procesos de baja prioridad (+19)
 
 ## Estructura del Scheduler
 
@@ -41,13 +59,36 @@ typedef struct {
     int policy;                      // Política de planificación
     int sync_mode;                   // Modo de sincronización (CLOCK o TIMER)
     void* sync_source;               // Timer* si sync_mode==TIMER, NULL si CLOCK
-    ProcessQueue* ready_queue;       // Cola de procesos listos
+    ProcessQueue* ready_queue;       // Cola de procesos listos (RR y BFS)
+    ProcessQueue** priority_queues;  // Array de colas para prioridades (40 colas)
     Machine* machine;                // Máquina con CPUs y cores
     pthread_t thread;                // Thread del scheduler
     volatile int running;            // Flag de control de ejecución
     volatile int total_completed;    // Total de procesos completados
 } Scheduler;
 ```
+
+## Estructura del PCB
+
+```c
+typedef struct {
+    int pid;
+    int state;
+    int priority;           // Prioridad: -20 (mayor) a 19 (menor)
+    int ttl;                // Time to live (actual)
+    int initial_ttl;        // TTL inicial (para reset)
+    int quantum_counter;    // Uso actual del quantum
+    int virtual_deadline;   // Virtual deadline para BFS
+} PCB;
+```
+
+## Prioridades
+
+- **Rango**: -20 a +19
+- **-20**: Mayor prioridad (más urgente)
+- **0**: Prioridad normal
+- **+19**: Menor prioridad (menos urgente)
+- Los procesos generados reciben prioridades aleatorias en todo el rango
 
 ## Parámetros de Línea de Comandos
 
@@ -91,15 +132,27 @@ typedef struct {
 ```
 En este caso, el timer interrumpirá cada 10 ticks, coincidiendo con el quantum.
 
-### Ejemplo 3: Brain Fuck Scheduler con reloj global
+### Ejemplo 3: Brain Fuck Scheduler con virtual deadlines
 ```bash
 ./kernel -q 5 -policy 1 -sync 0
 ```
+BFS calculará virtual deadlines para cada proceso: `deadline = tick_actual + (quantum * prioridad / 100)`
 
-### Ejemplo 4: Planificación con prioridades y timer
+### Ejemplo 4: Planificación con prioridades y múltiples colas
 ```bash
-./kernel -q 8 -policy 2 -sync 1
+./kernel -q 8 -policy 2 -sync 0
 ```
+Se crean 40 colas de prioridad (una por cada nivel de -20 a +19). Los procesos se ejecutan estrictamente por prioridad.
+
+**Ejemplo de expulsión por evento:**
+```bash
+./kernel -q 5 -policy 2 -sync 0 -f 3 -pmin 1 -pmax 2 -cpus 1 -cores 1 -threads 1
+```
+Con solo 1 thread, se puede observar claramente la expulsión:
+- Un proceso de baja prioridad (ej: +6) está ejecutándose
+- Llega un proceso de alta prioridad (ej: -16)
+- **Evento de expulsión**: El scheduler inmediatamente detiene el de baja prioridad y ejecuta el de alta prioridad
+- El proceso expulsado vuelve a su cola de prioridad correspondiente
 
 ### Ejemplo 5: Sistema completo personalizado
 ```bash
@@ -135,16 +188,54 @@ Cuando `sync_mode = SCHED_SYNC_TIMER`:
 
 La función `select_next_process()` implementa la lógica de selección según la política:
 
-- **Round Robin**: Extrae el primer proceso de la cola (FIFO)
-- **BFS**: Busca y extrae el proceso con menor PID
-- **Prioridades**: Busca y extrae el proceso con mayor prioridad (menor número)
+- **Round Robin**: Extrae el primer proceso de la cola única (FIFO)
+- **BFS**: Busca y extrae el proceso con menor virtual deadline de la cola única
+  - Calcula deadline al crear proceso: `deadline = tick + (quantum * prioridad / 100)`
+  - Recalcula deadline cuando el proceso vuelve a la cola tras agotar quantum
+- **Prioridades**: Busca en las 40 colas desde la prioridad -20 hasta +19
+  - Retorna el primer proceso de la primera cola no vacía
+  - Garantiza que procesos de mayor prioridad siempre se ejecutan primero
+
+### Colas de Preparados
+
+- **Round Robin y BFS**: Utilizan una única cola compartida (`ready_queue`)
+- **Prioridades Estáticas**: Utilizan un array de 40 colas (`priority_queues`)
+  - Índice 0 = Prioridad -20 (mayor)
+  - Índice 39 = Prioridad +19 (menor)
+  - Cada cola tiene capacidad: `ready_queue_size / 40` (mínimo 5)
+
+### Eventos que Activan el Scheduler (Event-Driven)
+
+Cuando se usa la política de prioridades estáticas, el scheduler se activa en los siguientes eventos:
+
+1. **Tick del reloj**: Evaluación periódica según configuración
+2. **Llegada de nuevo proceso**: Cuando un proceso entra a la cola de preparados
+3. **Fin de quantum**: Cuando un proceso agota su tiempo de CPU
+4. **Terminación de proceso**: Cuando un proceso completa su ejecución
+5. **Interrupción de timer**: Si está configurado con sincronización por timer
+
+En cada evento, el scheduler:
+- Evalúa las prioridades de todos los procesos
+- Si hay un proceso de alta prioridad esperando y slots ocupados por procesos de baja prioridad, **expulsa al de menor prioridad**
+- Asigna el CPU al proceso de mayor prioridad disponible
 
 ## Notas de Implementación
 
 1. **Quantum**: Define cuántos ticks puede ejecutar un proceso antes de ser expulsado
-2. **Prioridades**: En la política de prioridades, un valor menor indica mayor prioridad
-3. **Timer dedicado**: Cuando se usa sincronización con timer, se crea exactamente un timer con ID 0
-4. **Compatibilidad**: La función `create_scheduler()` mantiene compatibilidad con código anterior, usando Round Robin y sincronización con reloj global
+2. **Prioridades**: 
+   - Rango: -20 (mayor prioridad) a +19 (menor prioridad)
+   - Asignadas aleatoriamente por el generador de procesos
+   - Prioridades estáticas (no cambian durante la vida del proceso)
+3. **Virtual Deadline (BFS)**: 
+   - Fórmula: `deadline = T_actual + (quantum * prioridad / 100)`
+   - Procesos con prioridad negativa obtienen deadlines más tempranas
+   - Se recalcula cada vez que el proceso vuelve a la cola
+4. **Múltiples Colas (Prioridades)**:
+   - Se crean 40 colas al inicializar el scheduler con política PREEMPTIVE_PRIO
+   - El generador añade procesos a `ready_queue`; el scheduler los redistribuye
+   - Destrucción automática de todas las colas al terminar
+5. **Timer dedicado**: Cuando se usa sincronización con timer, se crea exactamente un timer con ID 0
+6. **Compatibilidad**: La función `create_scheduler()` mantiene compatibilidad con código anterior, usando Round Robin y sincronización con reloj global
 
 ## Compilación
 

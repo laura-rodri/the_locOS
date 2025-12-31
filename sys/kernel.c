@@ -20,11 +20,14 @@ static volatile int running = 1;  // Flag to control main loop
 
 // Clean up system resources
 void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
+    int scheduler_policy = SCHED_POLICY_ROUND_ROBIN;  // Default policy
+    
     printf("Stopping scheduler...\n");
     fflush(stdout);
     
     // Stop scheduler and print all running processes
     if (scheduler_global) {
+        scheduler_policy = scheduler_global->policy;  // Save policy before destroying
         stop_scheduler(scheduler_global);
         
         // Print all processes currently executing in the machine
@@ -53,6 +56,44 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
             printf("\tNo processes were running\n");
         }
         fflush(stdout);
+        
+        // For preemptive priority policy, print processes in priority queues BEFORE destroying scheduler
+        if (scheduler_global->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+            printf("\tPriority queues content:\n");
+            fflush(stdout);
+            
+            if (scheduler_global->priority_queues) {
+                int total_in_priority_queues = 0;
+                
+                // Iterate through all priority levels
+                for (int prio = MIN_PRIORITY; prio <= MAX_PRIORITY; prio++) {
+                    int queue_idx = prio - MIN_PRIORITY;
+                    ProcessQueue* pq = scheduler_global->priority_queues[queue_idx];
+                    
+                    if (pq && pq->current_size > 0) {
+                        printf("\t  Priority %d: %d process(es)\n", prio, pq->current_size);
+                        
+                        int idx = pq->front;
+                        for (int i = 0; i < pq->current_size; i++) {
+                            PCB* pcb = (PCB*)pq->queue[idx];
+                            printf("\t    PID=%d (TTL=%d)\n", pcb->pid, pcb->ttl);
+                            idx = (idx + 1) % pq->max_capacity;
+                        }
+                        
+                        total_in_priority_queues += pq->current_size;
+                    }
+                }
+                
+                if (total_in_priority_queues == 0) {
+                    printf("\t  (empty - all priority queues are empty)\n");
+                } else {
+                    printf("\t  Total processes in priority queues: %d\n", total_in_priority_queues);
+                }
+            } else {
+                printf("\t  (priority queues not initialized)\n");
+            }
+            fflush(stdout);
+        }
         
         destroy_scheduler(scheduler_global);
     }
@@ -86,19 +127,24 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
     
     printf("Cleaning ready queue...\n");
     fflush(stdout);
+    
     // Clean up ready queue and remaining processes
     if (ready_queue_global) {
-        printf("\tNumber of processes: %d\n", ready_queue_global->current_size);
+        printf("\tNumber of processes in ready_queue: %d\n", ready_queue_global->current_size);
         if (ready_queue_global->current_size > 0) {
-            printf("\tProcess IDs: ");
+            printf("\tProcesses in ready_queue:\n");
             int count = ready_queue_global->current_size;
             int idx = ready_queue_global->front;
             for (int i = 0; i < count; i++) {
                 PCB* pcb = (PCB*)ready_queue_global->queue[idx];
-                printf("%d ", pcb->pid);
+                // Print priority only if policy uses it (BFS and Preemptive Priority)
+                if (scheduler_policy != SCHED_POLICY_ROUND_ROBIN) {
+                    printf("\t  PID=%d (TTL=%d, Priority=%d)\n", pcb->pid, pcb->ttl, pcb->priority);
+                } else {
+                    printf("\t  PID=%d (TTL=%d)\n", pcb->pid, pcb->ttl);
+                }
                 idx = (idx + 1) % ready_queue_global->max_capacity;
             }
-            printf("\n");
         }
         fflush(stdout);
         
@@ -269,23 +315,8 @@ int main(int argc, char *argv[]) {
     int total_threads = num_cpus * num_cores * num_threads;
     int max_usable_threads = (total_threads < ready_queue_size) ? total_threads : ready_queue_size;
     
-    // Create process generator with machine reference and max_processes limit
-    proc_gen_global = create_process_generator(proc_gen_min, proc_gen_max, 
-                                               proc_ttl_min, proc_ttl_max,
-                                               ready_queue_global, machine_global, 
-                                               ready_queue_size);
-    if (!proc_gen_global) {
-        fprintf(stderr, "Failed to create process generator\n");
-        destroy_machine(machine_global);
-        destroy_process_queue(ready_queue_global);
-        stop_clock(clk_thread);
-        return 1;
-    }
-    
-    // Start process generator
-    start_process_generator(proc_gen_global);
-    
-    // Create scheduler with policy, sync mode, and optional timer
+    // Create scheduler with policy, sync mode, and optional timer BEFORE process generator
+    // This allows generator to check priority queues when counting processes
     scheduler_global = create_scheduler_with_policy(quantum, sched_policy, sched_sync, 
                                                      scheduler_timer, ready_queue_global, 
                                                      machine_global);
@@ -295,21 +326,38 @@ int main(int argc, char *argv[]) {
             destroy_timer(scheduler_timer);
             free(timers_global);
         }
-        stop_process_generator(proc_gen_global);
-        destroy_process_generator(proc_gen_global);
         destroy_machine(machine_global);
         destroy_process_queue(ready_queue_global);
         stop_clock(clk_thread);
         return 1;
     }
     
-    // Start scheduler
+    // Create process generator with machine and scheduler references
+    proc_gen_global = create_process_generator(proc_gen_min, proc_gen_max, 
+                                               proc_ttl_min, proc_ttl_max,
+                                               ready_queue_global, machine_global,
+                                               scheduler_global, ready_queue_size);
+    if (!proc_gen_global) {
+        fprintf(stderr, "Failed to create process generator\n");
+        destroy_scheduler(scheduler_global);
+        destroy_machine(machine_global);
+        destroy_process_queue(ready_queue_global);
+        if (scheduler_timer) {
+            destroy_timer(scheduler_timer);
+            free(timers_global);
+        }
+        stop_clock(clk_thread);
+        return 1;
+    }
+    
+    // Start process generator and scheduler
+    start_process_generator(proc_gen_global);
     start_scheduler(scheduler_global);
     
     const char* policy_names[] = {"Round Robin", "BFS", "Preemptive Priority"};
     const char* sync_names[] = {"Global Clock", "Timer"};
     
-    printf("\n=== System Configuration ===\n");
+    printf("\n\033[34m=== System Configuration ===\n");
     printf("Clock frequency:      %d Hz\n", CLOCK_FREQUENCY_HZ);
     printf("Scheduler:\n");
     printf("  - Quantum:          %d ticks\n", quantum);
@@ -327,7 +375,7 @@ int main(int argc, char *argv[]) {
     printf("  - Threads per core: %d\n", num_threads);
     printf("  - Total threads:    %d\n", total_threads);
     printf("  - Usable threads:   %d (limited by max_processes)\n", max_usable_threads);
-    printf("============================\n");
+    printf("============================\033[0m\n");
     printf("\nPress Ctrl+C to exit...\n\n");
     
     // Wait for signal using pause() which will be interrupted by SIGINT
@@ -336,10 +384,10 @@ int main(int argc, char *argv[]) {
     }
     
     // Cleanup
-    printf("\n=== System cleanup and shutdown ===\n");
+    printf("\n\033[31m=== System cleanup and shutdown ===\n");
     cleanup_system(clk_thread_global, timers_global, num_timers_global);
     free(timers_global);
-    printf("=== System shutdown complete ===\n");
+    printf("=== System shutdown complete ===\033[0m\n");
 
     return 0;
 }

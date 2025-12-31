@@ -21,6 +21,7 @@ PCB* create_pcb(int pid) {
     pcb->ttl = 0;          // Default time to live
     pcb->initial_ttl = 0;  // Default initial TTL
     pcb->quantum_counter = 0; // Initialize quantum counter
+    pcb->virtual_deadline = 0; // Initialize virtual deadline
     
     return pcb;
 }
@@ -150,9 +151,10 @@ void* process_generator_function(void* arg) {
             break;
         }
         
-        // Calculate current total processes (ready queue + executing)
+        // Calculate current total processes (ready queue + executing + priority queues)
         int executing_count = pg->machine ? count_executing_processes(pg->machine) : 0;
-        int total_processes = pg->ready_queue->current_size + executing_count;
+        int priority_queues_count = pg->scheduler ? count_processes_in_priority_queues(pg->scheduler) : 0;
+        int total_processes = pg->ready_queue->current_size + executing_count + priority_queues_count;
         
         // Check if we have space for new process
         if (total_processes >= pg->max_processes) {
@@ -179,6 +181,9 @@ void* process_generator_function(void* arg) {
                     ttl += rand() % (pg->max_ttl - pg->min_ttl + 1);
                 }
                 set_pcb_ttl(pending_pcb, ttl);
+                
+                // Set random priority in range [-20, 19]
+                pending_pcb->priority = MIN_PRIORITY + (rand() % NUM_PRIORITY_LEVELS);
             } else {
                 printf("[Process Generator] Failed to allocate PCB for PID=%d\n", new_pid);
                 __sync_fetch_and_sub(&pg->next_pid, 1);
@@ -200,9 +205,16 @@ void* process_generator_function(void* arg) {
                 waiting_for_space = 0;
             }
             
-            printf("[Process Generator] Created process PID=%d TTL=%d (total=%d, in_system=%d/%d)\n", 
-                   pending_pcb->pid, pending_pcb->ttl, pg->total_generated, 
-                   total_processes + 1, pg->max_processes);
+            // Print priority only if policy uses it (BFS and Preemptive Priority)
+            if (pg->scheduler && pg->scheduler->policy != SCHED_POLICY_ROUND_ROBIN) {
+                printf("[Process Generator] Created process PID=%d TTL=%d Priority=%d (created_total=%d, in_system=%d/%d)\n", 
+                       pending_pcb->pid, pending_pcb->ttl, pending_pcb->priority, pg->total_generated, 
+                       total_processes + 1, pg->max_processes);
+            } else {
+                printf("[Process Generator] Created process PID=%d TTL=%d (created_total=%d, in_system=%d/%d)\n", 
+                       pending_pcb->pid, pending_pcb->ttl, pg->total_generated, 
+                       total_processes + 1, pg->max_processes);
+            }
             fflush(stdout);
             
             // Clear pending PCB and calculate next generation time
@@ -238,7 +250,8 @@ void* process_generator_function(void* arg) {
 ProcessGenerator* create_process_generator(int min_interval, int max_interval, 
                                           int min_ttl, int max_ttl,
                                           ProcessQueue* ready_queue,
-                                          Machine* machine, int max_processes) {
+                                          Machine* machine, Scheduler* scheduler,
+                                          int max_processes) {
     if (!ready_queue || min_interval < 1 || max_interval < min_interval || 
         min_ttl < 1 || max_ttl < min_ttl || max_processes < 1) {
         fprintf(stderr, "Invalid process generator parameters\n");
@@ -254,6 +267,7 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
     pg->max_ttl = max_ttl;
     pg->ready_queue = ready_queue;
     pg->machine = machine;
+    pg->scheduler = scheduler;
     pg->max_processes = max_processes;
     pg->running = 0;
     pg->next_pid = 1;  // PIDs start from 1
@@ -304,27 +318,41 @@ void destroy_process_generator(ProcessGenerator* pg) {
 // Scheduler with Quantum
 // ============================================================================
 
+// Helper function: Check if there are processes ready to be scheduled
+static int has_ready_processes(Scheduler* sched) {
+    if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+        if (!sched->priority_queues) return 0;
+        for (int i = 0; i < NUM_PRIORITY_LEVELS; i++) {
+            if (sched->priority_queues[i] && sched->priority_queues[i]->current_size > 0) {
+                return 1;
+            }
+        }
+        return 0;
+    } else {
+        return sched->ready_queue && sched->ready_queue->current_size > 0;
+    }
+}
+
 // Helper function: Select next process based on policy
 static PCB* select_next_process(Scheduler* sched) {
-    if (sched->ready_queue->current_size == 0) {
-        return NULL;
-    }
-    
     switch (sched->policy) {
         case SCHED_POLICY_ROUND_ROBIN:
             // Simple FIFO - dequeue from front
+            if (sched->ready_queue->current_size == 0) return NULL;
             return dequeue_process(sched->ready_queue);
             
         case SCHED_POLICY_BFS: {
-            // Brain Fuck Scheduler - select process with lowest PID
-            int min_pid = -1;
+            // Brain Fuck Scheduler - select process with lowest virtual deadline
+            if (sched->ready_queue->current_size == 0) return NULL;
+            
+            int min_deadline = -1;
             int min_idx = -1;
             int idx = sched->ready_queue->front;
             
             for (int i = 0; i < sched->ready_queue->current_size; i++) {
                 PCB* pcb = (PCB*)sched->ready_queue->queue[idx];
-                if (min_pid == -1 || pcb->pid < min_pid) {
-                    min_pid = pcb->pid;
+                if (min_deadline == -1 || pcb->virtual_deadline < min_deadline) {
+                    min_deadline = pcb->virtual_deadline;
                     min_idx = idx;
                 }
                 idx = (idx + 1) % sched->ready_queue->max_capacity;
@@ -351,42 +379,140 @@ static PCB* select_next_process(Scheduler* sched) {
         }
             
         case SCHED_POLICY_PREEMPTIVE_PRIO: {
-            // Preemptive with static priorities - select highest priority (lowest number)
-            int max_prio = -1;
-            int max_idx = -1;
-            int idx = sched->ready_queue->front;
+            // Preemptive with static priorities - use multiple priority queues
+            // Search from highest priority (-20) to lowest (+19)
+            if (!sched->priority_queues) return NULL;
             
-            for (int i = 0; i < sched->ready_queue->current_size; i++) {
-                PCB* pcb = (PCB*)sched->ready_queue->queue[idx];
-                if (max_prio == -1 || pcb->priority < max_prio) {
-                    max_prio = pcb->priority;
-                    max_idx = idx;
+            for (int prio = MIN_PRIORITY; prio <= MAX_PRIORITY; prio++) {
+                int queue_idx = prio - MIN_PRIORITY;  // Convert priority to array index (0-39)
+                ProcessQueue* pq = sched->priority_queues[queue_idx];
+                
+                if (pq && pq->current_size > 0) {
+                    // Found a non-empty queue at this priority level
+                    PCB* selected = dequeue_process(pq);
+                    if (selected && pq->current_size > 0) {
+                        printf("[Scheduler] PRIORITY SELECTION: PID=%d (prio=%d) selected, %d more waiting at same priority\n",
+                               selected->pid, selected->priority, pq->current_size);
+                        fflush(stdout);
+                    }
+                    return selected;
                 }
-                idx = (idx + 1) % sched->ready_queue->max_capacity;
             }
             
-            if (max_idx == -1) return NULL;
-            
-            // Remove selected process from queue
-            PCB* selected = (PCB*)sched->ready_queue->queue[max_idx];
-            
-            // Shift elements to fill the gap
-            int current_idx = max_idx;
-            for (int i = 0; i < sched->ready_queue->current_size - 1; i++) {
-                int next_idx = (current_idx + 1) % sched->ready_queue->max_capacity;
-                sched->ready_queue->queue[current_idx] = sched->ready_queue->queue[next_idx];
-                current_idx = next_idx;
-            }
-            
-            sched->ready_queue->current_size--;
-            sched->ready_queue->rear = (sched->ready_queue->rear - 1 + sched->ready_queue->max_capacity) 
-                                       % sched->ready_queue->max_capacity;
-            
-            return selected;
+            // No processes in any queue
+            return NULL;
         }
             
         default:
-            return dequeue_process(sched->ready_queue);
+            if (sched->ready_queue && sched->ready_queue->current_size > 0) {
+                return dequeue_process(sched->ready_queue);
+            }
+            return NULL;
+    }
+}
+
+// Helper function: Enqueue process to appropriate queue based on policy
+static int enqueue_to_scheduler(Scheduler* sched, PCB* pcb) {
+    if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+        // Use priority queues
+        if (!sched->priority_queues) return -1;
+        
+        // Validate priority range
+        if (pcb->priority < MIN_PRIORITY || pcb->priority > MAX_PRIORITY) {
+            fprintf(stderr, "Invalid priority %d for process PID=%d\n", pcb->priority, pcb->pid);
+            return -1;
+        }
+        
+        int queue_idx = pcb->priority - MIN_PRIORITY;
+        return enqueue_process(sched->priority_queues[queue_idx], pcb);
+    } else {
+        // Use single ready queue for RR and BFS
+        return enqueue_process(sched->ready_queue, pcb);
+    }
+}
+
+// Get the lowest priority process currently executing and its location
+// Returns the priority value, or MAX_PRIORITY+1 if no processes executing
+int get_lowest_priority_executing(Machine* machine, int* cpu_idx, int* core_idx, int* thread_idx) {
+    if (!machine) return MAX_PRIORITY + 1;
+    
+    int lowest_priority = MAX_PRIORITY + 1;
+    *cpu_idx = -1;
+    *core_idx = -1;
+    *thread_idx = -1;
+    
+    for (int i = 0; i < machine->num_CPUs; i++) {
+        for (int j = 0; j < machine->cpus[i].num_cores; j++) {
+            Core* core = &machine->cpus[i].cores[j];
+            for (int k = 0; k < core->current_pcb_count; k++) {
+                PCB* pcb = &core->pcbs[k];
+                // Lower priority value = higher importance
+                // We want highest priority number (lowest importance)
+                if (pcb->priority > lowest_priority || lowest_priority == MAX_PRIORITY + 1) {
+                    lowest_priority = pcb->priority;
+                    *cpu_idx = i;
+                    *core_idx = j;
+                    *thread_idx = k;
+                }
+            }
+        }
+    }
+    
+    return lowest_priority;
+}
+
+// Count total processes in all priority queues
+int count_processes_in_priority_queues(Scheduler* sched) {
+    if (!sched || !sched->priority_queues) return 0;
+    
+    int total = 0;
+    for (int i = 0; i < NUM_PRIORITY_LEVELS; i++) {
+        if (sched->priority_queues[i]) {
+            total += sched->priority_queues[i]->current_size;
+        }
+    }
+    return total;
+}
+
+// Preempt processes of lower priority if a higher priority process arrives
+// This implements event-driven preemptive scheduling
+void preempt_lower_priority_processes(Scheduler* sched, int new_priority) {
+    if (!sched || !sched->machine) return;
+    if (sched->policy != SCHED_POLICY_PREEMPTIVE_PRIO) return;
+    
+    // Find if there's a process executing with lower priority (higher number)
+    int cpu_idx, core_idx, thread_idx;
+    int lowest_prio = get_lowest_priority_executing(sched->machine, &cpu_idx, &core_idx, &thread_idx);
+    
+    // If new process has higher priority (lower number), preempt the lowest priority one
+    if (lowest_prio != MAX_PRIORITY + 1 && new_priority < lowest_prio) {
+        Core* core = &sched->machine->cpus[cpu_idx].cores[core_idx];
+        PCB* preempted_pcb = &core->pcbs[thread_idx];
+        
+        printf("[Scheduler] PREEMPTION: Process PID=%d (prio=%d) preempting PID=%d (prio=%d) on CPU%d-Core%d-Thread%d\n",
+               -1, new_priority, preempted_pcb->pid, preempted_pcb->priority, 
+               cpu_idx, core_idx, thread_idx);
+        fflush(stdout);
+        
+        // Save the preempted process state
+        PCB* saved_pcb = create_pcb(preempted_pcb->pid);
+        if (saved_pcb) {
+            saved_pcb->state = WAITING;
+            saved_pcb->priority = preempted_pcb->priority;
+            saved_pcb->ttl = preempted_pcb->ttl;
+            saved_pcb->initial_ttl = preempted_pcb->initial_ttl;
+            saved_pcb->quantum_counter = 0;  // Reset quantum when preempted
+            saved_pcb->virtual_deadline = preempted_pcb->virtual_deadline;
+            
+            // Return to appropriate priority queue
+            enqueue_to_scheduler(sched, saved_pcb);
+        }
+        
+        // Remove preempted process from core
+        for (int l = thread_idx; l < core->current_pcb_count - 1; l++) {
+            core->pcbs[l] = core->pcbs[l + 1];
+        }
+        core->current_pcb_count--;
     }
 }
 
@@ -456,7 +582,26 @@ void* scheduler_function(void* arg) {
                                 ready_pcb->ttl = pcb->ttl;
                                 ready_pcb->initial_ttl = pcb->initial_ttl;
                                 ready_pcb->quantum_counter = 0;  // Reset quantum counter
-                                enqueue_process(sched->ready_queue, ready_pcb);
+                                
+                                // Calculate virtual deadline for BFS
+                                if (sched->policy == SCHED_POLICY_BFS) {
+                                    // deadline = T_actual + offset
+                                    // offset = rodaja_de_tiempo * prioridad / 100
+                                    int offset = (sched->quantum * ready_pcb->priority) / 100;
+                                    ready_pcb->virtual_deadline = last_tick + offset;
+                                    printf("[Scheduler] BFS: Process PID=%d virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
+                                           ready_pcb->pid, ready_pcb->virtual_deadline, last_tick, offset, ready_pcb->priority);
+                                    fflush(stdout);
+                                }
+                                
+                                enqueue_to_scheduler(sched, ready_pcb);
+                                
+                                // EVENT: Process returned to queue - this is an event
+                                // For preemptive priority, check if higher priority processes are waiting
+                                if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+                                    // Signal that queue state changed - scheduler will handle reassignment
+                                    pthread_cond_broadcast(&clk_cond);
+                                }
                             }
                             
                             // Remove from core
@@ -471,24 +616,66 @@ void* scheduler_function(void* arg) {
         }
         
         // Try to assign processes from ready queue to available cores
-        while (sched->ready_queue->current_size > 0 && can_cpu_execute_process(sched->machine)) {
+        // First, for PREEMPTIVE_PRIO, transfer processes from ready_queue to priority_queues
+        // This is event-driven: when new processes arrive, check for preemption
+        if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO && sched->ready_queue->current_size > 0) {
+            while (sched->ready_queue->current_size > 0) {
+                PCB* pcb = dequeue_process(sched->ready_queue);
+                if (pcb) {
+                    // EVENT: New process arrived - check if it should preempt a running process
+                    // This makes the scheduler event-driven and preemptive
+                    if (!can_cpu_execute_process(sched->machine)) {
+                        // No free slots - check if we should preempt
+                        preempt_lower_priority_processes(sched, pcb->priority);
+                    }
+                    
+                    // Enqueue to appropriate priority queue
+                    if (enqueue_to_scheduler(sched, pcb) != 0) {
+                        // Queue full, put back in ready_queue
+                        enqueue_process(sched->ready_queue, pcb);
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        while (has_ready_processes(sched) && can_cpu_execute_process(sched->machine)) {
             PCB* pcb = select_next_process(sched);
             if (pcb) {
                 pcb->state = RUNNING;
                 pcb->quantum_counter = 0;  // Reset quantum counter for new execution
                 
+                // Calculate virtual deadline for BFS when assigning for first time
+                if (sched->policy == SCHED_POLICY_BFS && pcb->virtual_deadline == 0) {
+                    int offset = (sched->quantum * pcb->priority) / 100;
+                    pcb->virtual_deadline = last_tick + offset;
+                    printf("[Scheduler] BFS: Process PID=%d initial virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
+                           pcb->pid, pcb->virtual_deadline, last_tick, offset, pcb->priority);
+                    fflush(stdout);
+                }
+                
                 if (assign_process_to_core(sched->machine, pcb)) {
-                    printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d, Priority=%d)\n", 
-                           pcb->pid, pcb->ttl, pcb->priority);
+                    // Print priority only if policy uses it (BFS and Preemptive Priority)
+                    if (sched->policy != SCHED_POLICY_ROUND_ROBIN) {
+                        printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d, Priority=%d)\n", 
+                               pcb->pid, pcb->ttl, pcb->priority);
+                    } else {
+                        printf("[Scheduler] Process PID=%d assigned to execution (TTL=%d)\n", 
+                               pcb->pid, pcb->ttl);
+                    }
                     fflush(stdout);
                     
                     // Free the original PCB since assign_process_to_core makes a copy
                     destroy_pcb(pcb);
                 } else {
                     // Couldn't assign - put back in queue
-                    enqueue_process(sched->ready_queue, pcb);
+                    enqueue_to_scheduler(sched, pcb);
                     break;
                 }
+            } else {
+                break;
             }
         }
         
@@ -543,6 +730,49 @@ Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode,
     sched->machine = machine;
     sched->running = 0;
     sched->total_completed = 0;
+    sched->priority_queues = NULL;
+    
+    // Create priority queues if using PREEMPTIVE_PRIO policy
+    if (policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+        sched->priority_queues = malloc(sizeof(ProcessQueue*) * NUM_PRIORITY_LEVELS);
+        if (!sched->priority_queues) {
+            fprintf(stderr, "Failed to allocate priority queues array\n");
+            free(sched);
+            return NULL;
+        }
+        
+        // Create a queue for each priority level
+        // Capacity: floor(max_capacity / 40) ensures total ≤ max_capacity
+        int queue_capacity = ready_queue->max_capacity / NUM_PRIORITY_LEVELS;
+        
+        // Minimum capacity must be at least 2 to be useful
+        if (queue_capacity < 2) {
+            fprintf(stderr, "Warning: Max processes (%d) too small for %d priority levels. ",
+                    ready_queue->max_capacity, NUM_PRIORITY_LEVELS);
+            fprintf(stderr, "Recommend at least %d. Using capacity 2 anyway.\n",
+                    NUM_PRIORITY_LEVELS * 2);
+            queue_capacity = 2;
+        }
+        
+        int total_capacity = queue_capacity * NUM_PRIORITY_LEVELS;
+        
+        for (int i = 0; i < NUM_PRIORITY_LEVELS; i++) {
+            sched->priority_queues[i] = create_process_queue(queue_capacity);
+            if (!sched->priority_queues[i]) {
+                fprintf(stderr, "Failed to create priority queue %d\n", i);
+                // Clean up previously created queues
+                for (int j = 0; j < i; j++) {
+                    destroy_process_queue(sched->priority_queues[j]);
+                }
+                free(sched->priority_queues);
+                free(sched);
+                return NULL;
+            }
+        }
+        
+        printf("[Scheduler] Created %d priority queues (capacity %d each, total %d/%d)\n", 
+               NUM_PRIORITY_LEVELS, queue_capacity, total_capacity, ready_queue->max_capacity);
+    }
     
     return sched;
 }
@@ -585,6 +815,22 @@ void destroy_scheduler(Scheduler* sched) {
         if (sched->running) {
             stop_scheduler(sched);
         }
+        
+        // Clean up priority queues if they exist
+        if (sched->priority_queues) {
+            for (int i = 0; i < NUM_PRIORITY_LEVELS; i++) {
+                if (sched->priority_queues[i]) {
+                    // Free any remaining processes in the queue
+                    PCB* pcb;
+                    while ((pcb = dequeue_process(sched->priority_queues[i])) != NULL) {
+                        destroy_pcb(pcb);
+                    }
+                    destroy_process_queue(sched->priority_queues[i]);
+                }
+            }
+            free(sched->priority_queues);
+        }
+        
         free(sched);
     }
 }
