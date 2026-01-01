@@ -16,7 +16,18 @@ static ProcessGenerator* proc_gen_global = NULL;
 static Scheduler* scheduler_global = NULL;
 static ProcessQueue* ready_queue_global = NULL;
 static Machine* machine_global = NULL;
-static volatile int running = 1;  // Flag to control main loop
+volatile int running = 1;  // Flag to control main loop and system components
+
+// Timer callback function - activates the scheduler
+void timer_scheduler_callback(int timer_id, void* user_data) {
+    Scheduler* sched = (Scheduler*)user_data;
+    if (sched) {
+        // Signal the scheduler to wake up and do its work
+        pthread_mutex_lock(&sched->sched_mutex);
+        pthread_cond_signal(&sched->sched_cond);
+        pthread_mutex_unlock(&sched->sched_mutex);
+    }
+}
 
 // Clean up system resources
 void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
@@ -170,12 +181,26 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
 
 // Catch Ctrl+C to clean up and exit successfully
 void handle_sigint(int sig) {
-    printf("\nCaught signal %d, shutting down...\n", sig);
+    printf("\n\n\033[31mCaught signal %d, shutting down...", sig);
     running = 0;  // Signal main loop to exit
+    
+    // Wake up all waiting threads immediately
+    pthread_mutex_lock(&clk_mutex);
+    pthread_cond_broadcast(&clk_cond);
+    pthread_mutex_unlock(&clk_mutex);
+    
+    // Wake up scheduler if it's waiting on its own condition variable
+    if (scheduler_global && scheduler_global->sync_mode == SCHED_SYNC_TIMER) {
+        pthread_mutex_lock(&scheduler_global->sched_mutex);
+        pthread_cond_broadcast(&scheduler_global->sched_cond);
+        pthread_mutex_unlock(&scheduler_global->sched_mutex);
+    }
 }
 
 int main(int argc, char *argv[]) {
-    int quantum = 5;              // Default quantum (ticks per process)
+    int quantum = 3;              // Default quantum (ticks per process)
+    int num_timers = 1;           // Default number of timers
+    int timer_interval = 5;       // Default timer interval (ticks)
     int proc_gen_min = 3;         // Default min interval for process generation (ticks)
     int proc_gen_max = 10;        // Default max interval for process generation (ticks)
     int proc_ttl_min = 10;        // Default min TTL for processes (ticks)
@@ -191,18 +216,20 @@ int main(int argc, char *argv[]) {
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         printf("Usage:\n   %s [flags]\n", argv[0]);
         printf("Flags:\n");
-        printf("   -f <hz>           Clock frequency in Hz (default: 1)\n");
-        printf("   -q <ticks>        Scheduler quantum (max ticks per process) (default: 5)\n");
-        printf("   -policy <num>     Scheduler policy: 0=RR, 1=BFS, 2=PreemptivePrio (default: 0)\n");
-        printf("   -sync <mode>      Sync mode: 0=Clock, 1=Timer (default: 0)\n");
-        printf("   -pmin <ticks>     Min interval for process generation in ticks (default: 3)\n");
-        printf("   -pmax <ticks>     Max interval for process generation in ticks (default: 10)\n");
-        printf("   -tmin <ticks>     Min TTL for processes in ticks (default: 10)\n");
-        printf("   -tmax <ticks>     Max TTL for processes in ticks (default: 50)\n");
-        printf("   -qsize <num>      Ready queue size (default: 100)\n");
-        printf("   -cpus <num>       Number of CPUs (default: 1)\n");
-        printf("   -cores <num>      Number of cores per CPU (default: 2)\n");
-        printf("   -threads <num>    Number of kernel threads per core (default: 4)\n");
+        printf("   -f <hz>            Clock frequency in Hz (default: 1)\n");
+        printf("   -q <ticks>         Scheduler quantum (max ticks per process) (default: 3)\n");
+        printf("   -t <num>           Number of timers (default: 1)\n");
+        printf("   -timeri <ticks>    Interval for timer interruptions in ticks (default: 5)\n");
+        printf("   -policy <num>      Scheduler policy: 0=RR, 1=BFS, 2=PreemptivePrio (default: 0)\n");
+        printf("   -sync <mode>       Sync mode: 0=Clock, 1=Timer (default: 0)\n");
+        printf("   -pgenmin <ticks>   Min interval for process generation in ticks (default: 3)\n");
+        printf("   -pgenmax <ticks>   Max interval for process generation in ticks (default: 10)\n");
+        printf("   -ttlmin <ticks>    Min TTL for processes in ticks (default: 10)\n");
+        printf("   -ttlmax <ticks>    Max TTL for processes in ticks (default: 50)\n");
+        printf("   -qsize <num>       Ready queue size (default: 100)\n");
+        printf("   -cpus <num>        Number of CPUs (default: 1)\n");
+        printf("   -cores <num>       Number of cores per CPU (default: 2)\n");
+        printf("   -threads <num>     Number of kernel threads per core (default: 4)\n");
         return 0;
     }
 
@@ -215,6 +242,12 @@ int main(int argc, char *argv[]) {
                 } else if (strcmp(argv[i], "-q")==0) {
                     i++;
                     quantum = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 5;
+                } else if (strcmp(argv[i], "-t")==0) {
+                    i++;
+                    num_timers = (atoi(argv[i]) >= 0) ? atoi(argv[i]) : 1;
+                } else if (strcmp(argv[i], "-timert")==0) {
+                    i++;
+                    timer_interval = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 5;
                 } else if (strcmp(argv[i], "-policy")==0) {
                     i++;
                     int policy = atoi(argv[i]);
@@ -227,16 +260,16 @@ int main(int argc, char *argv[]) {
                     if (sync >= 0 && sync <= 1) {
                         sched_sync = sync;
                     }
-                } else if (strcmp(argv[i], "-pmin")==0) {
+                } else if (strcmp(argv[i], "-pgenmin")==0) {
                     i++;
                     proc_gen_min = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 3;
-                } else if (strcmp(argv[i], "-pmax")==0) {
+                } else if (strcmp(argv[i], "-pgenmax")==0) {
                     i++;
                     proc_gen_max = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 10;
-                } else if (strcmp(argv[i], "-tmin")==0) {
+                } else if (strcmp(argv[i], "-ttlmin")==0) {
                     i++;
                     proc_ttl_min = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 10;
-                } else if (strcmp(argv[i], "-tmax")==0) {
+                } else if (strcmp(argv[i], "-ttlmax")==0) {
                     i++;
                     proc_ttl_max = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 50;
                 } else if (strcmp(argv[i], "-qsize")==0) {
@@ -267,33 +300,6 @@ int main(int argc, char *argv[]) {
     }
     clk_thread_global = clk_thread;
 
-    // Create timer if using timer synchronization
-    Timer* scheduler_timer = NULL;
-    if (sched_sync == SCHED_SYNC_TIMER) {
-        // Create one timer with quantum interval
-        timers_global = malloc(sizeof(Timer*) * 1);
-        if (!timers_global) {
-            fprintf(stderr, "Failed to allocate timer array\n");
-            stop_clock(clk_thread);
-            return 1;
-        }
-        
-        scheduler_timer = create_timer(0, quantum, NULL, NULL);
-        if (!scheduler_timer) {
-            fprintf(stderr, "Failed to create scheduler timer\n");
-            free(timers_global);
-            stop_clock(clk_thread);
-            return 1;
-        }
-        
-        timers_global[0] = scheduler_timer;
-        num_timers_global = 1;
-    } else {
-        // No timers needed - scheduler syncs with global clock
-        timers_global = NULL;
-        num_timers_global = 0;
-    }
-    
     // Create ready queue for processes
     ready_queue_global = create_process_queue(ready_queue_size);
     if (!ready_queue_global) {
@@ -311,25 +317,92 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    // Set machine reference in clock so it can decrement TTL
+    set_clock_machine(machine_global);
+    
     // Calculate maximum usable kernel threads (limited by qsize)
     int total_threads = num_cpus * num_cores * num_threads;
     int max_usable_threads = (total_threads < ready_queue_size) ? total_threads : ready_queue_size;
     
-    // Create scheduler with policy, sync mode, and optional timer BEFORE process generator
-    // This allows generator to check priority queues when counting processes
+    // Create scheduler with policy and sync mode (without timer yet for TIMER mode)
     scheduler_global = create_scheduler_with_policy(quantum, sched_policy, sched_sync, 
-                                                     scheduler_timer, ready_queue_global, 
+                                                     NULL, ready_queue_global, 
                                                      machine_global);
     if (!scheduler_global) {
         fprintf(stderr, "Failed to create scheduler\n");
-        if (scheduler_timer) {
-            destroy_timer(scheduler_timer);
-            free(timers_global);
-        }
         destroy_machine(machine_global);
         destroy_process_queue(ready_queue_global);
         stop_clock(clk_thread);
         return 1;
+    }
+    
+    // Create timers
+    Timer* scheduler_timer = NULL;
+    
+    // Determine how many timers to create:
+    // - If sync mode is TIMER: use num_timers, at least 1
+    // - If sync mode is CLOCK: create num_timers but they won't affect execution
+//    int timers_to_create = (sched_sync == SCHED_SYNC_TIMER && num_timers < 1) ? 1 : num_timers;
+    int timers_to_create = 0;
+    if (sched_sync == SCHED_SYNC_TIMER) {
+        timers_to_create = (num_timers < 1) ? 1 : num_timers+1;  // +1 for scheduler timer
+    } else {
+        timers_to_create = num_timers;
+    }
+
+    if (timers_to_create > 0) {
+        timers_global = malloc(sizeof(Timer*) * timers_to_create);
+        if (!timers_global) {
+            fprintf(stderr, "Failed to allocate timer array\n");
+            destroy_scheduler(scheduler_global);
+            destroy_machine(machine_global);
+            destroy_process_queue(ready_queue_global);
+            stop_clock(clk_thread);
+            return 1;
+        }
+        
+        // Create all timers
+        for (int i = 0; i < timers_to_create; i++) {
+            Timer* timer = NULL;
+            
+            if (i == 0 && sched_sync == SCHED_SYNC_TIMER) {
+                // First timer for scheduler synchronization (uses quantum as interval)
+                timer = create_timer(i, quantum, timer_scheduler_callback, scheduler_global);
+                scheduler_timer = timer;
+            } else {
+                // Additional timers without callback (use timer_interval for verification)
+                timer = create_timer(i, timer_interval, NULL, NULL);
+            }
+            
+            if (!timer) {
+                fprintf(stderr, "Failed to create timer %d\n", i);
+                // Clean up previously created timers
+                for (int j = 0; j < i; j++) {
+                    if (timers_global[j]) {
+                        destroy_timer(timers_global[j]);
+                    }
+                }
+                free(timers_global);
+                destroy_scheduler(scheduler_global);
+                destroy_machine(machine_global);
+                destroy_process_queue(ready_queue_global);
+                stop_clock(clk_thread);
+                return 1;
+            }
+            
+            timers_global[i] = timer;
+        }
+        
+        num_timers_global = timers_to_create;
+        
+        // Update scheduler with timer reference if using timer sync
+        if (sched_sync == SCHED_SYNC_TIMER && scheduler_timer) {
+            scheduler_global->sync_source = scheduler_timer;
+        }
+    } else {
+        // No timers needed
+        timers_global = NULL;
+        num_timers_global = 0;
     }
     
     // Create process generator with machine and scheduler references
@@ -342,18 +415,19 @@ int main(int argc, char *argv[]) {
         destroy_scheduler(scheduler_global);
         destroy_machine(machine_global);
         destroy_process_queue(ready_queue_global);
-        if (scheduler_timer) {
-            destroy_timer(scheduler_timer);
+        if (timers_global) {
+            for (int i = 0; i < num_timers_global; i++) {
+                if (timers_global[i]) {
+                    destroy_timer(timers_global[i]);
+                }
+            }
             free(timers_global);
         }
         stop_clock(clk_thread);
         return 1;
     }
     
-    // Start process generator and scheduler
-    start_process_generator(proc_gen_global);
-    start_scheduler(scheduler_global);
-    
+    // Print system configuration BEFORE starting components
     const char* policy_names[] = {"Round Robin", "BFS", "Preemptive Priority"};
     const char* sync_names[] = {"Global Clock", "Timer"};
     
@@ -363,8 +437,17 @@ int main(int argc, char *argv[]) {
     printf("  - Quantum:          %d ticks\n", quantum);
     printf("  - Policy:           %s\n", policy_names[sched_policy]);
     printf("  - Sync mode:        %s\n", sync_names[sched_sync]);
-    if (sched_sync == SCHED_SYNC_TIMER) {
-        printf("  - Timer interval:   %d ticks\n", quantum);
+    if (num_timers_global > 0) {
+        printf("Timers:               %d\n", num_timers_global);
+        if (sched_sync == SCHED_SYNC_TIMER) {
+            printf("  - Timer 0:          syncs scheduler (interval: %d ticks)\n", quantum);
+            if (num_timers_global > 1) {
+                printf("  - Timers 1-%d:       interval: %d ticks (no effect on execution)\n", 
+                       num_timers_global - 1, timer_interval);
+            }
+        } else {
+            printf("  - All timers:       interval: %d ticks (no effect on execution)\n", timer_interval);
+        }
     }
     printf("Process gen interval: %d-%d ticks\n", proc_gen_min, proc_gen_max);
     printf("Process TTL range:    %d-%d ticks\n", proc_ttl_min, proc_ttl_max);
@@ -375,8 +458,29 @@ int main(int argc, char *argv[]) {
     printf("  - Threads per core: %d\n", num_threads);
     printf("  - Total threads:    %d\n", total_threads);
     printf("  - Usable threads:   %d (limited by max_processes)\n", max_usable_threads);
-    printf("============================\033[0m\n");
+    printf("============================\033[0m");
     printf("\nPress Ctrl+C to exit...\n\n");
+    
+    // Print warnings and info about scheduler creation (if using priority queues)
+    if (sched_policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+        int queue_capacity = ready_queue_size / 40;  // NUM_PRIORITY_LEVELS = 40
+        if (queue_capacity < 2) {
+            fprintf(stderr, "Warning: Max processes (%d) too small for 40 priority levels. ",
+                    ready_queue_size);
+            fprintf(stderr, "Recommend at least 80. Using capacity 2 anyway.\n");
+            queue_capacity = 2;
+        }
+        int total_capacity = queue_capacity * 40;
+        printf("[Scheduler] Created 40 priority queues (capacity %d each, total %d/%d)\n", 
+               queue_capacity, total_capacity, ready_queue_size);
+    }
+    
+    // Start process generator and scheduler
+    start_process_generator(proc_gen_global);
+    start_scheduler(scheduler_global);
+
+    printf("\n\033[32m=== Running system ===\033[0m\n");
+    fflush(stdout);
     
     // Wait for signal using pause() which will be interrupted by SIGINT
     while (running) {
@@ -384,7 +488,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Cleanup
-    printf("\n\033[31m=== System cleanup and shutdown ===\n");
+    printf("\n=== System cleanup and shutdown ===\n");
     cleanup_system(clk_thread_global, timers_global, num_timers_global);
     free(timers_global);
     printf("=== System shutdown complete ===\033[0m\n");

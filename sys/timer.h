@@ -3,6 +3,9 @@
 
 #include <pthread.h>
 
+// Global flag to control system execution
+extern volatile int running;
+
 // Callback function type for timer interrupts
 typedef void (*timer_callback_t)(int timer_id, void* user_data);
 

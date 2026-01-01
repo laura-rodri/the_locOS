@@ -170,6 +170,25 @@ Este comando configura:
 
 ## Funcionamiento Interno
 
+### Separación de Responsabilidades: Clock vs Scheduler
+
+**CRÍTICO**: El sistema tiene una separación clara de responsabilidades entre el reloj y el scheduler:
+
+- **Clock (clock_sys.c)**:
+  - Genera ticks periódicos según la frecuencia configurada
+  - **Decrementa el TTL** de todos los procesos en ejecución
+  - Mantiene una referencia a Machine para acceder a los procesos
+  - Notifica a todos los componentes mediante broadcast
+
+- **Scheduler (process.c)**:
+  - Gestiona la asignación de procesos a cores
+  - Verifica procesos completados (TTL=0)
+  - Verifica procesos que agotaron su quantum
+  - Selecciona nuevos procesos según la política configurada
+  - **NO decrementa TTL** - esto es responsabilidad del clock
+
+Esta separación evita conflictos de mutex y race conditions.
+
 ### Sincronización con Reloj Global
 Cuando `sync_mode = SCHED_SYNC_CLOCK`:
 - El scheduler se despierta en cada tick del reloj
@@ -180,9 +199,12 @@ Cuando `sync_mode = SCHED_SYNC_CLOCK`:
 ### Sincronización con Timer
 Cuando `sync_mode = SCHED_SYNC_TIMER`:
 - Se crea un timer con intervalo igual al quantum
-- El timer genera interrupciones periódicas
-- El scheduler se activa con las interrupciones del timer
+- El timer genera interrupciones periódicas cada quantum ticks
+- El timer ejecuta un callback que despierta al scheduler
+- El scheduler se activa únicamente con las señales del timer
 - El quantum del timer y del scheduler están sincronizados
+- **Ventaja**: Evita activaciones innecesarias del scheduler en cada tick del reloj
+- El clock sigue decrementando TTL independientemente
 
 ### Selección de Procesos
 
@@ -198,11 +220,19 @@ La función `select_next_process()` implementa la lógica de selección según l
 
 ### Colas de Preparados
 
-- **Round Robin y BFS**: Utilizan una única cola compartida (`ready_queue`)
-- **Prioridades Estáticas**: Utilizan un array de 40 colas (`priority_queues`)
-  - Índice 0 = Prioridad -20 (mayor)
-  - Índice 39 = Prioridad +19 (menor)
-  - Cada cola tiene capacidad: `ready_queue_size / 40` (mínimo 5)
+El sistema usa diferentes estructuras según la política:
+
+- **Round Robin y BFS**: Una única cola global (`ready_queue`)
+  - Todos los procesos comparten la misma cola
+  - RR: Extrae en orden FIFO
+  - BFS: Busca el de menor virtual deadline
+  
+- **Prioridades Estáticas**: 40 colas de prioridad (`priority_queues`)
+  - Una cola por cada nivel de prioridad (-20 a +19)
+  - Los procesos se añaden a la cola de su prioridad
+  - El scheduler siempre busca en las colas de mayor prioridad primero
+  - Dentro de cada cola se usa FIFO
+  - Capacidad distribuida: `ready_queue_size / 40` por cola
 
 ### Eventos que Activan el Scheduler (Event-Driven)
 
@@ -222,20 +252,35 @@ En cada evento, el scheduler:
 ## Notas de Implementación
 
 1. **Quantum**: Define cuántos ticks puede ejecutar un proceso antes de ser expulsado
-2. **Prioridades**: 
+
+2. **TTL (Time To Live)**: 
+   - **CRÍTICO**: Decrementado por el Clock del sistema, NO por el scheduler
+   - Cuando TTL llega a 0, el proceso se marca como completado
+   - El scheduler detecta TTL=0 y retira el proceso de ejecución
+
+3. **Prioridades**: 
    - Rango: -20 (mayor prioridad) a +19 (menor prioridad)
    - Asignadas aleatoriamente por el generador de procesos
    - Prioridades estáticas (no cambian durante la vida del proceso)
-3. **Virtual Deadline (BFS)**: 
+
+4. **Virtual Deadline (BFS)**: 
    - Fórmula: `deadline = T_actual + (quantum * prioridad / 100)`
    - Procesos con prioridad negativa obtienen deadlines más tempranas
    - Se recalcula cada vez que el proceso vuelve a la cola
-4. **Múltiples Colas (Prioridades)**:
+
+5. **Múltiples Colas (Prioridades)**:
    - Se crean 40 colas al inicializar el scheduler con política PREEMPTIVE_PRIO
    - El generador añade procesos a `ready_queue`; el scheduler los redistribuye
    - Destrucción automática de todas las colas al terminar
-5. **Timer dedicado**: Cuando se usa sincronización con timer, se crea exactamente un timer con ID 0
-6. **Compatibilidad**: La función `create_scheduler()` mantiene compatibilidad con código anterior, usando Round Robin y sincronización con reloj global
+
+6. **Timer dedicado**: 
+   - Cuando se usa sincronización con timer, se crea exactamente un timer con ID 0
+   - El timer ejecuta un callback que despierta al scheduler mediante señales
+   - Evita problemas de mutex anidados usando condition variables
+
+7. **Compatibilidad**: 
+   - La función `create_scheduler()` mantiene compatibilidad con código anterior
+   - Usa Round Robin y sincronización con reloj global por defecto
 
 ## Compilación
 

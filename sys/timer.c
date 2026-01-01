@@ -8,31 +8,35 @@
 void* timer_function(void* arg) {
     Timer* timer = (Timer*)arg;
     
-    while (timer->running) {
+    while (timer->running && running) {
         pthread_mutex_lock(&clk_mutex);
         
         // Wait for enough clock ticks to pass since last interruption
-        while (timer->running && (clk_counter - timer->last_tick) < timer->interval) {
+        while (timer->running && running && (clk_counter - timer->last_tick) < timer->interval) {
             pthread_cond_wait(&clk_cond, &clk_mutex);
         }
         
-        if (!timer->running) {
+        if (!timer->running || !running) {
             pthread_mutex_unlock(&clk_mutex);
             break;
         }
         
         // Generate timer interruption
         timer->last_tick = clk_counter;
-        printf("Timer %d interrupted at tick %d (interval=%d)\n", 
-               timer->id, clk_counter, timer->interval);
-        fflush(stdout);
         
-        // Execute callback if provided
-        if (timer->callback) {
-            timer->callback(timer->id, timer->user_data);
+        // Only print message if timer doesn't have a callback (not used for scheduler sync)
+        if (!timer->callback) {
+            printf("[Timer] Timer %d interrupted at tick %d (interval=%d)\n", 
+                   timer->id, clk_counter, timer->interval);
+            fflush(stdout);
         }
         
         pthread_mutex_unlock(&clk_mutex);
+        
+        // Execute callback if provided (outside clk_mutex to avoid deadlock)
+        if (timer->callback) {
+            timer->callback(timer->id, timer->user_data);
+        }
     }
     return NULL;
 }

@@ -138,15 +138,15 @@ void* process_generator_function(void* arg) {
     // Seed random number generator with current time + thread ID
     srand(time(NULL) ^ (unsigned long)pthread_self());
     
-    while (pg->running) {
+    while (pg->running && running) {
         pthread_mutex_lock(&clk_mutex);
         
         // Wait until next generation time
-        while (pg->running && clk_counter < next_generation_tick) {
+        while (pg->running && running && clk_counter < next_generation_tick) {
             pthread_cond_wait(&clk_cond, &clk_mutex);
         }
         
-        if (!pg->running) {
+        if (!pg->running || !running) {
             pthread_mutex_unlock(&clk_mutex);
             break;
         }
@@ -476,8 +476,8 @@ int count_processes_in_priority_queues(Scheduler* sched) {
 
 // Preempt processes of lower priority if a higher priority process arrives
 // This implements event-driven preemptive scheduling
-void preempt_lower_priority_processes(Scheduler* sched, int new_priority) {
-    if (!sched || !sched->machine) return;
+void preempt_lower_priority_processes(Scheduler* sched, PCB* new_pcb) {
+    if (!sched || !sched->machine || !new_pcb) return;
     if (sched->policy != SCHED_POLICY_PREEMPTIVE_PRIO) return;
     
     // Find if there's a process executing with lower priority (higher number)
@@ -485,12 +485,12 @@ void preempt_lower_priority_processes(Scheduler* sched, int new_priority) {
     int lowest_prio = get_lowest_priority_executing(sched->machine, &cpu_idx, &core_idx, &thread_idx);
     
     // If new process has higher priority (lower number), preempt the lowest priority one
-    if (lowest_prio != MAX_PRIORITY + 1 && new_priority < lowest_prio) {
+    if (lowest_prio != MAX_PRIORITY + 1 && new_pcb->priority < lowest_prio) {
         Core* core = &sched->machine->cpus[cpu_idx].cores[core_idx];
         PCB* preempted_pcb = &core->pcbs[thread_idx];
         
         printf("[Scheduler] PREEMPTION: Process PID=%d (prio=%d) preempting PID=%d (prio=%d) on CPU%d-Core%d-Thread%d\n",
-               -1, new_priority, preempted_pcb->pid, preempted_pcb->priority, 
+               new_pcb->pid, new_pcb->priority, preempted_pcb->pid, preempted_pcb->priority, 
                cpu_idx, core_idx, thread_idx);
         fflush(stdout);
         
@@ -517,45 +517,69 @@ void preempt_lower_priority_processes(Scheduler* sched, int new_priority) {
 }
 
 // Scheduler thread function - manages process execution with fixed quantum
+// CRITICAL: The scheduler is now ONLY activated by Timer interrupts (for SCHED_SYNC_TIMER)
+// or by clock ticks (for SCHED_SYNC_CLOCK). The clock itself decrements TTL.
 void* scheduler_function(void* arg) {
     Scheduler* sched = (Scheduler*)arg;
     int last_tick = 0;
     
-    while (sched->running) {
-        pthread_mutex_lock(&clk_mutex);
-        
-        // Wait for next clock tick
-        while (sched->running && clk_counter == last_tick) {
-            pthread_cond_wait(&clk_cond, &clk_mutex);
+    while (sched->running && running) {
+        if (sched->sync_mode == SCHED_SYNC_TIMER) {
+            // Wait for scheduler activation signal from timer
+            pthread_mutex_lock(&sched->sched_mutex);
+            pthread_cond_wait(&sched->sched_cond, &sched->sched_mutex);
+            pthread_mutex_unlock(&sched->sched_mutex);
+            
+            if (!sched->running || !running) {
+                break;
+            }
+            
+            printf("[Scheduler] Activated by Timer at tick %d\n", get_current_tick());
+            fflush(stdout);
+        } else {
+            // SCHED_SYNC_CLOCK: Wait for clock ticks
+            pthread_mutex_lock(&clk_mutex);
+            
+            // Wait for next clock tick
+            while (sched->running && running && clk_counter == last_tick) {
+                pthread_cond_wait(&clk_cond, &clk_mutex);
+            }
+            
+            if (!sched->running || !running) {
+                pthread_mutex_unlock(&clk_mutex);
+                break;
+            }
+            
+            last_tick = clk_counter;
+            // DON'T unlock here - keep mutex for processing below
         }
         
-        if (!sched->running) {
-            pthread_mutex_unlock(&clk_mutex);
-            break;
+        // Now process all executing processes to check for completion or quantum expiration
+        // NOTE: TTL decrement is done by the clock, not here!
+        // For TIMER mode, we need to lock. For CLOCK mode, we already have the lock
+        if (sched->sync_mode == SCHED_SYNC_TIMER) {
+            pthread_mutex_lock(&clk_mutex);
         }
-        
-        last_tick = clk_counter;
         
         // Process all currently executing processes in all cores
-        if (sched->machine) {
-            for (int i = 0; i < sched->machine->num_CPUs; i++) {
-                for (int j = 0; j < sched->machine->cpus[i].num_cores; j++) {
+        if (sched->machine && running) {
+            for (int i = 0; i < sched->machine->num_CPUs && running; i++) {
+                for (int j = 0; j < sched->machine->cpus[i].num_cores && running; j++) {
                     Core* core = &sched->machine->cpus[i].cores[j];
                     
                     // Process each PCB in this core (iterate backwards to safely remove)
-                    for (int k = core->current_pcb_count - 1; k >= 0; k--) {
+                    for (int k = core->current_pcb_count - 1; k >= 0 && running; k--) {
                         PCB* pcb = &core->pcbs[k];
                         
-                        // Decrement TTL and increment quantum counter
-                        int new_ttl = decrement_pcb_ttl(pcb);
+                        // Increment quantum counter (TTL is decremented by clock!)
                         pcb->quantum_counter++;
                         
-                        printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d executing (TTL=%d, quantum=%d/%d)\n", 
-                               i, j, k, pcb->pid, new_ttl, pcb->quantum_counter, sched->quantum);
+                        printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d (TTL=%d, quantum=%d/%d)\n", 
+                               i, j, k, pcb->pid, pcb->ttl, pcb->quantum_counter, sched->quantum);
                         fflush(stdout);
                         
-                        // Check if process completed or quantum expired
-                        if (new_ttl <= 0) {
+                        // Check if process completed (TTL reached 0)
+                        if (pcb->ttl <= 0) {
                             // Process completed
                             printf("[Scheduler] Process PID=%d COMPLETED - removing from CPU%d-Core%d-Thread%d\n", 
                                    pcb->pid, i, j, k);
@@ -588,9 +612,10 @@ void* scheduler_function(void* arg) {
                                     // deadline = T_actual + offset
                                     // offset = rodaja_de_tiempo * prioridad / 100
                                     int offset = (sched->quantum * ready_pcb->priority) / 100;
-                                    ready_pcb->virtual_deadline = last_tick + offset;
+                                    int current_tick = clk_counter;  // Use clk_counter directly since we have mutex
+                                    ready_pcb->virtual_deadline = current_tick + offset;
                                     printf("[Scheduler] BFS: Process PID=%d virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
-                                           ready_pcb->pid, ready_pcb->virtual_deadline, last_tick, offset, ready_pcb->priority);
+                                           ready_pcb->pid, ready_pcb->virtual_deadline, current_tick, offset, ready_pcb->priority);
                                     fflush(stdout);
                                 }
                                 
@@ -619,14 +644,14 @@ void* scheduler_function(void* arg) {
         // First, for PREEMPTIVE_PRIO, transfer processes from ready_queue to priority_queues
         // This is event-driven: when new processes arrive, check for preemption
         if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO && sched->ready_queue->current_size > 0) {
-            while (sched->ready_queue->current_size > 0) {
+            while (running && sched->ready_queue->current_size > 0) {
                 PCB* pcb = dequeue_process(sched->ready_queue);
                 if (pcb) {
                     // EVENT: New process arrived - check if it should preempt a running process
                     // This makes the scheduler event-driven and preemptive
                     if (!can_cpu_execute_process(sched->machine)) {
                         // No free slots - check if we should preempt
-                        preempt_lower_priority_processes(sched, pcb->priority);
+                        preempt_lower_priority_processes(sched, pcb);
                     }
                     
                     // Enqueue to appropriate priority queue
@@ -641,7 +666,7 @@ void* scheduler_function(void* arg) {
             }
         }
         
-        while (has_ready_processes(sched) && can_cpu_execute_process(sched->machine)) {
+        while (running && has_ready_processes(sched) && can_cpu_execute_process(sched->machine)) {
             PCB* pcb = select_next_process(sched);
             if (pcb) {
                 pcb->state = RUNNING;
@@ -650,9 +675,10 @@ void* scheduler_function(void* arg) {
                 // Calculate virtual deadline for BFS when assigning for first time
                 if (sched->policy == SCHED_POLICY_BFS && pcb->virtual_deadline == 0) {
                     int offset = (sched->quantum * pcb->priority) / 100;
-                    pcb->virtual_deadline = last_tick + offset;
+                    int current_tick = clk_counter;  // Use clk_counter directly since we have mutex
+                    pcb->virtual_deadline = current_tick + offset;
                     printf("[Scheduler] BFS: Process PID=%d initial virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
-                           pcb->pid, pcb->virtual_deadline, last_tick, offset, pcb->priority);
+                           pcb->pid, pcb->virtual_deadline, current_tick, offset, pcb->priority);
                     fflush(stdout);
                 }
                 
@@ -713,11 +739,8 @@ Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode,
         return NULL;
     }
     
-    // If using timer sync, sync_source must be provided
-    if (sync_mode == SCHED_SYNC_TIMER && !sync_source) {
-        fprintf(stderr, "Timer sync mode requires a valid Timer pointer\n");
-        return NULL;
-    }
+    // Note: If using timer sync, sync_source will be set later after timer creation
+    // (timer needs scheduler reference, so we create scheduler first)
     
     Scheduler* sched = malloc(sizeof(Scheduler));
     if (!sched) return NULL;
@@ -731,6 +754,10 @@ Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode,
     sched->running = 0;
     sched->total_completed = 0;
     sched->priority_queues = NULL;
+    
+    // Initialize scheduler mutex and condition variable
+    pthread_mutex_init(&sched->sched_mutex, NULL);
+    pthread_cond_init(&sched->sched_cond, NULL);
     
     // Create priority queues if using PREEMPTIVE_PRIO policy
     if (policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
@@ -747,14 +774,8 @@ Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode,
         
         // Minimum capacity must be at least 2 to be useful
         if (queue_capacity < 2) {
-            fprintf(stderr, "Warning: Max processes (%d) too small for %d priority levels. ",
-                    ready_queue->max_capacity, NUM_PRIORITY_LEVELS);
-            fprintf(stderr, "Recommend at least %d. Using capacity 2 anyway.\n",
-                    NUM_PRIORITY_LEVELS * 2);
             queue_capacity = 2;
         }
-        
-        int total_capacity = queue_capacity * NUM_PRIORITY_LEVELS;
         
         for (int i = 0; i < NUM_PRIORITY_LEVELS; i++) {
             sched->priority_queues[i] = create_process_queue(queue_capacity);
@@ -769,9 +790,6 @@ Scheduler* create_scheduler_with_policy(int quantum, int policy, int sync_mode,
                 return NULL;
             }
         }
-        
-        printf("[Scheduler] Created %d priority queues (capacity %d each, total %d/%d)\n", 
-               NUM_PRIORITY_LEVELS, queue_capacity, total_capacity, ready_queue->max_capacity);
     }
     
     return sched;
@@ -830,6 +848,10 @@ void destroy_scheduler(Scheduler* sched) {
             }
             free(sched->priority_queues);
         }
+        
+        // Destroy mutex and condition variable
+        pthread_mutex_destroy(&sched->sched_mutex);
+        pthread_cond_destroy(&sched->sched_cond);
         
         free(sched);
     }

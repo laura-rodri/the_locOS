@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Test.sh - Script de pruebas para el kernel locOS
-# Prueba diferentes configuraciones del scheduler
+# Prueba diferentes configuraciones del scheduler y modos de sincronización
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,6 +15,7 @@ TEST_DURATION=5
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   locOS Kernel Test Suite${NC}"
+echo -e "${BLUE}   Tests de Scheduler y Sincronización${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
@@ -166,6 +167,11 @@ echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}   Tests completados${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
+echo -e "${YELLOW}Notas sobre el sistema:${NC}"
+echo -e "  - El Clock decrementa TTL de procesos en ejecución"
+echo -e "  - El Scheduler gestiona asignación y expulsión"
+echo -e "  - Sincronización: Clock (cada tick) o Timer (cada quantum)"
+echo ""
 echo -e "${YELLOW}Ejecuta tests individuales con:${NC}"
 echo -e "  ./kernel -q <quantum> -policy <0|1|2> -sync <0|1> [opciones]"
 echo ""
@@ -175,8 +181,8 @@ echo -e "  1 = BFS (Brain Fuck Scheduler con virtual deadlines)"
 echo -e "  2 = Prioridades Estáticas (40 colas de prioridad/nice)"
 echo ""
 echo -e "${YELLOW}Modos de sincronización:${NC}"
-echo -e "  0 = Reloj Global"
-echo -e "  1 = Timer dedicado"
+echo -e "  0 = Reloj Global (scheduler se activa cada tick)"
+echo -e "  1 = Timer dedicado (scheduler se activa cada quantum ticks)"
 echo ""
 echo -e "${YELLOW}Para ver todas las opciones:${NC}"
 echo -e "  ./kernel --help"

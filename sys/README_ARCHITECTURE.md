@@ -60,12 +60,16 @@ Reloj global que genera ticks periódicos:
 - Frecuencia configurable (Hz)
 - Sincronización mediante mutex y condition variables
 - Notifica a todos los componentes (broadcast)
+- **CRÍTICO**: El reloj del sistema decrementa el TTL de todos los procesos en ejecución
+- Mantiene referencia a la Machine para acceder a los procesos en ejecución
 
 ### 4. **timer.h/c** - Timers de Interrupción
 Timers que generan interrupciones cada N ticks:
 - Intervalo configurable
 - Se sincronizan con el reloj global
 - Útiles para scheduling y eventos periódicos
+- **Sistema de callbacks**: Los timers pueden ejecutar funciones callback al interrumpir
+- Usados para activar el scheduler en modo SCHED_SYNC_TIMER
 
 ### 5. **kernel.c** - Integración
 Main del kernel que inicializa y coordina todos los componentes.
@@ -86,25 +90,39 @@ make
 
 ### Flags disponibles
 - `-f <hz>`: Frecuencia del reloj en Hz (default: 1)
-- `-t <ticks>`: Intervalo de interrupción de timers (default: 5)
+- `-q <ticks>`: Quantum del scheduler en ticks (default: 5)
+- `-policy <num>`: Política de planificación (default: 0)
+  - `0`: Round Robin sin prioridades
+  - `1`: Brain Fuck Scheduler (BFS) con virtual deadlines
+  - `2`: Política expulsora con prioridades estáticas (-20 a +19)
+- `-sync <mode>`: Modo de sincronización del scheduler (default: 0)
+  - `0`: Sincronización con reloj global (activación cada tick)
+  - `1`: Sincronización con timer dedicado (activación cada quantum ticks)
 - `-pmin <ticks>`: Intervalo mínimo de generación de procesos (default: 3)
 - `-pmax <ticks>`: Intervalo máximo de generación de procesos (default: 10)
-- `-pcount <num>`: Número máximo de procesos a generar, 0=ilimitado (default: 20)
+- `-tmin <ticks>`: TTL mínimo de procesos (default: 10)
+- `-tmax <ticks>`: TTL máximo de procesos (default: 50)
 - `-qsize <num>`: Tamaño de la cola de procesos listos (default: 100)
+- `-cpus <num>`: Número de CPUs (default: 1)
+- `-cores <num>`: Número de cores por CPU (default: 2)
+- `-threads <num>`: Número de kernel threads por core (default: 4)
 
 ### Ejemplos
 ```bash
-# Ejecutar con configuración por defecto
+# Ejecutar con configuración por defecto (Round Robin + Clock)
 ./kernel
 
-# Reloj a 2 Hz, timers cada 4 ticks, generar hasta 10 procesos
-./kernel -f 2 -t 4 -pcount 10
+# Round Robin con timer, reloj a 2 Hz, quantum de 8 ticks
+./kernel -f 2 -q 8 -policy 0 -sync 1
 
-# Reloj rápido (10 Hz), procesos frecuentes
-./kernel -f 10 -pmin 1 -pmax 3
+# BFS con reloj rápido (10 Hz), procesos frecuentes
+./kernel -f 10 -policy 1 -pmin 1 -pmax 3
 
-# Generación ilimitada de procesos
-./kernel -pcount 0
+# Prioridades estáticas con expulsión por evento
+./kernel -policy 2 -q 5 -f 2
+
+# Sistema completo personalizado
+./kernel -f 2 -q 10 -policy 2 -sync 1 -cpus 2 -cores 4 -threads 2 -tmin 20 -tmax 100
 ```
 
 ## 📍 Ubicación de Componentes
@@ -131,14 +149,22 @@ Cola de procesos **listos para ejecutar**:
 ## 🔄 Flujo de Ejecución
 
 1. **Clock** genera un tick cada 1/Hz segundos
-2. **Clock** notifica a todos los componentes (broadcast)
-3. **Timers** verifican si deben generar una interrupción
-4. **Process Generator** verifica si debe crear un nuevo proceso
-5. Si toca generar:
-   - Crea un nuevo PCB con PID único
-   - Lo añade a la Ready Queue
+2. **Clock** decrementa el TTL de todos los procesos en ejecución (CRÍTICO)
+3. **Clock** notifica a todos los componentes (broadcast)
+4. **Timers** verifican si deben generar una interrupción
+5. **Timer del scheduler** (si sync_mode=TIMER) activa el scheduler con su callback
+6. **Process Generator** verifica si debe crear un nuevo proceso
+7. Si toca generar:
+   - Crea un nuevo PCB con PID único y prioridad aleatoria
+   - Lo añade a la Ready Queue (o cola de prioridad correspondiente)
    - Calcula el próximo tiempo de generación (aleatorio)
-6. Los procesos quedan en Ready Queue esperando al scheduler
+8. **Scheduler** se activa (por clock o por timer según configuración)
+9. **Scheduler** verifica procesos completados (TTL=0) o quantum expirado
+10. **Scheduler** asigna nuevos procesos desde las colas a los cores libres
+11. Los procesos quedan en ejecución hasta que:
+    - Su TTL llegue a 0 (completado)
+    - Su quantum expire (vuelta a cola)
+    - Sean expulsados por otro de mayor prioridad (solo policy=2)
 
 ## 📊 Estados de Proceso
 
@@ -148,19 +174,37 @@ Cola de procesos **listos para ejecutar**:
 
 ## 🧪 Testing
 
-Para probar el Process Generator durante 10 segundos:
+Para probar el sistema durante 10 segundos:
 ```bash
-timeout 10 ./kernel -f 2 -t 4 -pmin 2 -pmax 5 -pcount 10
+# Round Robin con reloj global
+timeout 10 ./kernel -f 2 -q 5 -policy 0 -sync 0
+
+# BFS con timer
+timeout 10 ./kernel -f 2 -q 8 -policy 1 -sync 1
+
+# Prioridades con expulsión
+timeout 10 ./kernel -f 3 -q 5 -policy 2 -sync 0 -cpus 1 -cores 1 -threads 1
 ```
 
 Deberías ver:
-- Ticks del reloj cada 0.5 segundos (2 Hz)
-- Interrupciones de timers cada 4 ticks
-- Creación de procesos cada 2-5 ticks (aleatorio)
-- Máximo 10 procesos generados
+- Ticks del reloj según la frecuencia configurada
+- Decrementos de TTL realizados por el clock
+- Interrupciones de timers (si sync=1)
+- Creación de procesos con prioridades aleatorias
+- Asignación y expulsión de procesos según la política
+- Scheduler activándose según el modo de sincronización
+
+Para ejecutar la suite completa de tests:
+```bash
+./Test.sh
+```
 
 ## 📝 Notas
 
 - El archivo `clock.c` original se mantiene para referencia
+- **Separación de responsabilidades**: El reloj del sistema decrementa TTL, el scheduler gestiona asignaciones
 - Los warnings de compilación sobre `struct PCB *` vs `PCB *` son menores y no afectan la funcionalidad
+- El scheduler puede sincronizarse con el reloj global o con un timer dedicado
+- Las prioridades van de -20 (mayor) a +19 (menor), con 40 niveles totales
+- El modo timer evita activaciones innecesarias del scheduler en cada tick
 - Presiona Ctrl+C para terminar el sistema limpiamente

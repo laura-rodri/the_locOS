@@ -3,6 +3,9 @@
 
 #include <pthread.h>
 
+// Global flag to control system execution
+extern volatile int running;
+
 // Forward declarations
 typedef struct Machine Machine;
 typedef struct Scheduler Scheduler;
@@ -75,6 +78,8 @@ typedef struct Scheduler {
     pthread_t thread;                // Scheduler thread
     volatile int running;            // Flag to control scheduler execution
     volatile int total_completed;    // Total processes completed
+    pthread_mutex_t sched_mutex;     // Mutex for scheduler activation
+    pthread_cond_t sched_cond;       // Condition variable for scheduler activation
 } Scheduler;
 
 // PCB management
@@ -115,7 +120,7 @@ void* scheduler_function(void* arg);
 
 // Preemptive priority helper functions
 int get_lowest_priority_executing(Machine* machine, int* cpu_idx, int* core_idx, int* thread_idx);
-void preempt_lower_priority_processes(Scheduler* sched, int new_priority);
+void preempt_lower_priority_processes(Scheduler* sched, PCB* new_pcb);
 int count_processes_in_priority_queues(Scheduler* sched);
 
 #endif // PROCESS_H
