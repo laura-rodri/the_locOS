@@ -23,6 +23,11 @@ PCB* create_pcb(int pid) {
     pcb->quantum_counter = 0; // Initialize quantum counter
     pcb->virtual_deadline = 0; // Initialize virtual deadline
     
+    // Initialize memory management fields
+    pcb->mm.code = NULL;
+    pcb->mm.data = NULL;
+    pcb->mm.pgb = NULL;
+    
     return pcb;
 }
 

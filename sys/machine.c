@@ -9,10 +9,38 @@ Core* create_core(int num_kernel_threads) {
     
     core->num_kernel_threads = num_kernel_threads;
     core->current_pcb_count = 0;
+    
+    // Legacy PCB array (kept for compatibility)
     core->pcbs = malloc(sizeof(PCB) * num_kernel_threads);
     if (!core->pcbs) {
         free(core);
         return NULL;
+    }
+    
+    // Initialize hardware threads
+    core->hw_threads = malloc(sizeof(HardwareThread) * num_kernel_threads);
+    if (!core->hw_threads) {
+        free(core->pcbs);
+        free(core);
+        return NULL;
+    }
+    
+    // Initialize each hardware thread
+    for (int i = 0; i < num_kernel_threads; i++) {
+        core->hw_threads[i].PC = 0;
+        core->hw_threads[i].IR = 0;
+        core->hw_threads[i].PTBR = NULL;
+        core->hw_threads[i].mmu.page_table_base = NULL;
+        core->hw_threads[i].mmu.enabled = 0;
+        core->hw_threads[i].pcb = NULL;
+        
+        // Initialize TLB
+        for (int j = 0; j < TLB_SIZE; j++) {
+            core->hw_threads[i].tlb.entries[j].virtual_page = 0;
+            core->hw_threads[i].tlb.entries[j].physical_frame = 0;
+            core->hw_threads[i].tlb.entries[j].valid = 0;
+        }
+        core->hw_threads[i].tlb.next_replace = 0;
     }
     
     return core;
@@ -32,18 +60,18 @@ CPU* create_cpu(int num_cores, int num_kernel_threads) {
     
     // Initialize each core
     for (int i = 0; i < num_cores; i++) {
-        cpu->cores[i].num_kernel_threads = num_kernel_threads;
-        cpu->cores[i].current_pcb_count = 0;
-        cpu->cores[i].pcbs = malloc(sizeof(PCB) * num_kernel_threads);
-        if (!cpu->cores[i].pcbs) {
+        Core* new_core = create_core(num_kernel_threads);
+        if (!new_core) {
             // Cleanup on failure
             for (int j = 0; j < i; j++) {
-                free(cpu->cores[j].pcbs);
+                destroy_core(&cpu->cores[j]);
             }
             free(cpu->cores);
             free(cpu);
             return NULL;
         }
+        cpu->cores[i] = *new_core;
+        free(new_core);  // Free the wrapper, we copied the contents
     }
     
     return cpu;
@@ -80,18 +108,16 @@ Machine* create_machine(int num_cpus, int num_cores, int num_kernel_threads) {
         
         // Initialize each core in this CPU
         for (int j = 0; j < num_cores; j++) {
-            machine->cpus[i].cores[j].num_kernel_threads = num_kernel_threads;
-            machine->cpus[i].cores[j].current_pcb_count = 0;
-            machine->cpus[i].cores[j].pcbs = malloc(sizeof(PCB) * num_kernel_threads);
-            if (!machine->cpus[i].cores[j].pcbs) {
+            Core* new_core = create_core(num_kernel_threads);
+            if (!new_core) {
                 // Cleanup on failure
                 for (int k = 0; k < j; k++) {
-                    free(machine->cpus[i].cores[k].pcbs);
+                    destroy_core(&machine->cpus[i].cores[k]);
                 }
                 free(machine->cpus[i].cores);
                 for (int k = 0; k < i; k++) {
                     for (int l = 0; l < machine->cpus[k].num_cores; l++) {
-                        free(machine->cpus[k].cores[l].pcbs);
+                        destroy_core(&machine->cpus[k].cores[l]);
                     }
                     free(machine->cpus[k].cores);
                 }
@@ -99,6 +125,8 @@ Machine* create_machine(int num_cpus, int num_cores, int num_kernel_threads) {
                 free(machine);
                 return NULL;
             }
+            machine->cpus[i].cores[j] = *new_core;
+            free(new_core);  // Free the wrapper, we copied the contents
         }
     }
     
@@ -109,7 +137,8 @@ Machine* create_machine(int num_cpus, int num_cores, int num_kernel_threads) {
 void destroy_core(Core* core) {
     if (core) {
         free(core->pcbs);
-        free(core);
+        free(core->hw_threads);
+        // Note: don't free 'core' itself when it's part of an array
     }
 }
 

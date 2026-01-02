@@ -20,6 +20,13 @@ typedef struct Scheduler Scheduler;
 #define MAX_PRIORITY 19   // Lowest priority
 #define NUM_PRIORITY_LEVELS 40  // From -20 to 19
 
+// Memory Management structure for each process
+typedef struct {
+    void* code;             // Virtual address of code segment start
+    void* data;             // Virtual address of data segment start
+    void* pgb;              // Physical address of page table base
+} MemoryManagement;
+
 // Process Control Block
 typedef struct {
     int pid;
@@ -29,6 +36,7 @@ typedef struct {
     int initial_ttl;        // Initial TTL value (for reset)
     int quantum_counter;    // Current quantum usage
     int virtual_deadline;   // Virtual deadline for BFS scheduling
+    MemoryManagement mm;    // Memory management information
     // etc - extend as needed
 } PCB;
 
