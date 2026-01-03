@@ -1,6 +1,7 @@
 #include "clock_sys.h"
 #include "machine.h"
 #include "process.h"
+#include "memory.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -14,6 +15,7 @@ volatile int clk_counter = 0;
 
 // Machine reference to decrement TTL of executing processes
 Machine* clock_machine_ref = NULL;
+PhysicalMemory* clock_pm_ref = NULL;
 
 // Clock increments clk_counter at desired frequency, decrements TTL of executing processes,
 // and signals waiting threads
@@ -39,15 +41,30 @@ void* clock_function(void* arg) {
                 for (int j = 0; j < clock_machine_ref->cpus[i].num_cores; j++) {
                     Core* core = &clock_machine_ref->cpus[i].cores[j];
                     
-                    // Decrement TTL for each executing process
-                    for (int k = 0; k < core->current_pcb_count; k++) {
-                        PCB* pcb = &core->pcbs[k];
+                    // For each hardware thread in this core
+                    for (int k = 0; k < core->num_kernel_threads; k++) {
+                        HardwareThread* hw_thread = &core->hw_threads[k];
+                        
+                        // Skip if no PCB assigned
+                        if (!hw_thread->pcb) continue;
+                        
+                        PCB* pcb = hw_thread->pcb;
+                        
+                        // Decrement TTL
                         int old_ttl = pcb->ttl;
                         int new_ttl = decrement_pcb_ttl(pcb);
                         
                         printf("[Clock] CPU%d-Core%d-Thread%d: PID=%d TTL: %d -> %d\n",
                                i, j, k, pcb->pid, old_ttl, new_ttl);
                         fflush(stdout);
+                        
+                        // FASE 2: Execute instruction cycle if memory is available
+                        if (clock_pm_ref && pcb->state != TERMINATED) {
+                            printf("[Exec] CPU%d-Core%d-Thread%d: PID=%d executing... ", 
+                                   i, j, k, pcb->pid);
+                            fflush(stdout);
+                            execute_instruction_cycle(hw_thread, clock_pm_ref);
+                        }
                     }
                 }
             }
@@ -88,5 +105,12 @@ int get_current_tick(void) {
 void set_clock_machine(Machine* machine) {
     pthread_mutex_lock(&clk_mutex);
     clock_machine_ref = machine;
+    pthread_mutex_unlock(&clk_mutex);
+}
+
+// Set the physical memory reference for instruction execution
+void set_clock_physical_memory(PhysicalMemory* pm) {
+    pthread_mutex_lock(&clk_mutex);
+    clock_pm_ref = pm;
     pthread_mutex_unlock(&clk_mutex);
 }

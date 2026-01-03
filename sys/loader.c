@@ -31,22 +31,18 @@ void destroy_loader(Loader* loader) {
     }
 }
 
-// Load a program from a text file
+// Load a program from a .elf file (prometheus format)
 // File format:
-// Line 1: PROGRAM <name>
-// Line 2: CODE_SIZE <size_in_words>
-// Line 3: DATA_SIZE <size_in_words>
-// Line 4: ENTRY_POINT <address>
-// Line 5: PRIORITY <priority>
-// Line 6: TTL <time_to_live>
-// Line 7: CODE_SECTION
-// Lines 8+: <hex_word> (one per line, code_size lines)
-// Line N: DATA_SECTION
-// Lines N+1+: <hex_word> (one per line, data_size lines)
-Program* load_program_from_file(const char* filename) {
+// .text <hex_address>     # Start of code section
+// .data <hex_address>     # Start of data section
+// <hex_instruction>       # Instructions/data follow (8 hex digits per line)
+// ...
+// Note: The .elf format uses absolute virtual addresses
+// We need to load the entire program into a contiguous virtual address space
+Program* load_program_from_elf(const char* filename) {
     FILE* file = fopen(filename, "r");
     if (!file) {
-        fprintf(stderr, "Error: Cannot open program file '%s'\n", filename);
+        fprintf(stderr, "Error: Cannot open ELF file '%s'\n", filename);
         return NULL;
     }
     
@@ -56,171 +52,135 @@ Program* load_program_from_file(const char* filename) {
         return NULL;
     }
     
-    char line[512];
-    char keyword[64];
-    
-    // Read header
-    // Line 1: PROGRAM <name>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %s", keyword, program->header.program_name) != 2 ||
-            strcmp(keyword, "PROGRAM") != 0) {
-            fprintf(stderr, "Error: Invalid program header\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Line 2: CODE_SIZE <size>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %u", keyword, &program->header.code_size) != 2 ||
-            strcmp(keyword, "CODE_SIZE") != 0) {
-            fprintf(stderr, "Error: Invalid CODE_SIZE\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Line 3: DATA_SIZE <size>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %u", keyword, &program->header.data_size) != 2 ||
-            strcmp(keyword, "DATA_SIZE") != 0) {
-            fprintf(stderr, "Error: Invalid DATA_SIZE\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Line 4: ENTRY_POINT <address>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %u", keyword, &program->header.entry_point) != 2 ||
-            strcmp(keyword, "ENTRY_POINT") != 0) {
-            fprintf(stderr, "Error: Invalid ENTRY_POINT\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Line 5: PRIORITY <priority>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %u", keyword, &program->header.priority) != 2 ||
-            strcmp(keyword, "PRIORITY") != 0) {
-            fprintf(stderr, "Error: Invalid PRIORITY\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Line 6: TTL <ttl>
-    if (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "%s %u", keyword, &program->header.ttl) != 2 ||
-            strcmp(keyword, "TTL") != 0) {
-            fprintf(stderr, "Error: Invalid TTL\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-    }
-    
-    // Allocate code segment
-    if (program->header.code_size > 0) {
-        program->code_segment = malloc(sizeof(uint32_t) * program->header.code_size);
-        if (!program->code_segment) {
-            fprintf(stderr, "Error: Failed to allocate code segment\n");
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-        
-        // Line 7: CODE_SECTION
-        if (fgets(line, sizeof(line), file)) {
-            if (sscanf(line, "%s", keyword) != 1 || strcmp(keyword, "CODE_SECTION") != 0) {
-                fprintf(stderr, "Error: Expected CODE_SECTION\n");
-                free(program->code_segment);
-                free(program);
-                fclose(file);
-                return NULL;
-            }
-        }
-        
-        // Read code segment data
-        for (uint32_t i = 0; i < program->header.code_size; i++) {
-            if (fgets(line, sizeof(line), file)) {
-                if (sscanf(line, "%x", &program->code_segment[i]) != 1) {
-                    fprintf(stderr, "Error: Invalid code data at line %u\n", i);
-                    free(program->code_segment);
-                    free(program);
-                    fclose(file);
-                    return NULL;
-                }
-            } else {
-                fprintf(stderr, "Error: Unexpected end of file in code section\n");
-                free(program->code_segment);
-                free(program);
-                fclose(file);
-                return NULL;
-            }
-        }
+    // Extract program name from filename
+    const char* name_start = strrchr(filename, '/');
+    if (name_start) {
+        name_start++;  // Skip the '/'
     } else {
-        program->code_segment = NULL;
+        name_start = filename;
+    }
+    strncpy(program->header.program_name, name_start, MAX_PROGRAM_NAME - 1);
+    program->header.program_name[MAX_PROGRAM_NAME - 1] = '\0';
+    
+    // Default values
+    program->header.entry_point = 0;
+    program->header.priority = 0;
+    program->header.ttl = 50;  // Default TTL
+    program->header.text_address = 0;  // Will be set from .text directive
+    program->header.data_address = 0;  // Will be set from .data directive
+    
+    char line[512];
+    uint32_t text_addr = 0;
+    uint32_t data_addr = 0;
+    int found_text = 0;
+    int found_data = 0;
+    
+    // First pass: find .text and .data addresses and count words
+    uint32_t total_words = 0;
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, ".text", 5) == 0) {
+            sscanf(line, ".text %x", &text_addr);
+            program->header.text_address = text_addr;  // Already a byte address
+            found_text = 1;
+        } else if (strncmp(line, ".data", 5) == 0) {
+            sscanf(line, ".data %x", &data_addr);
+            program->header.data_address = data_addr;  // Already a byte address
+            found_data = 1;
+        } else if (found_text && line[0] != '.' && line[0] != '\n') {
+            // This is a hex word
+            uint32_t dummy;
+            if (sscanf(line, "%x", &dummy) == 1) {
+                total_words++;
+            }
+        }
     }
     
-    // Allocate data segment
+    if (!found_text) {
+        fprintf(stderr, "Error: .text section not found in '%s'\n", filename);
+        free(program);
+        fclose(file);
+        return NULL;
+    }
+    
+    // Calculate the size of code and data based on addresses
+    // The entire program is loaded as one contiguous block starting at text_addr
+    if (found_data && data_addr > text_addr) {
+        // Calculate code size in words (from text_addr to data_addr)
+        program->header.code_size = (data_addr - text_addr) / WORD_SIZE;
+        // Remaining words are data
+        program->header.data_size = total_words - program->header.code_size;
+    } else {
+        // Everything is code if no .data section
+        program->header.code_size = total_words;
+        program->header.data_size = 0;
+    }
+    
+    // Allocate one contiguous segment for the entire program
+    // This makes it easier to load into virtual memory
+    uint32_t total_size = program->header.code_size + program->header.data_size;
+    uint32_t* full_program = malloc(sizeof(uint32_t) * total_size);
+    if (!full_program) {
+        fprintf(stderr, "Error: Failed to allocate program memory\n");
+        free(program);
+        fclose(file);
+        return NULL;
+    }
+    
+    // Second pass: read actual data
+    rewind(file);
+    uint32_t word_idx = 0;
+    int in_sections = 0;
+    
+    while (fgets(line, sizeof(line), file)) {
+        // Skip directive lines
+        if (line[0] == '.') {
+            in_sections = 1;
+            continue;
+        }
+        
+        if (in_sections && line[0] != '\n') {
+            uint32_t word_value;
+            if (sscanf(line, "%x", &word_value) == 1) {
+                if (word_idx < total_size) {
+                    full_program[word_idx] = word_value;
+                    word_idx++;
+                }
+            }
+        }
+    }
+    
+    fclose(file);
+    
+    // Split into code and data segments
+    program->code_segment = malloc(sizeof(uint32_t) * program->header.code_size);
     if (program->header.data_size > 0) {
         program->data_segment = malloc(sizeof(uint32_t) * program->header.data_size);
-        if (!program->data_segment) {
-            fprintf(stderr, "Error: Failed to allocate data segment\n");
-            if (program->code_segment) free(program->code_segment);
-            free(program);
-            fclose(file);
-            return NULL;
-        }
-        
-        // Line N: DATA_SECTION
-        if (fgets(line, sizeof(line), file)) {
-            if (sscanf(line, "%s", keyword) != 1 || strcmp(keyword, "DATA_SECTION") != 0) {
-                fprintf(stderr, "Error: Expected DATA_SECTION\n");
-                if (program->code_segment) free(program->code_segment);
-                free(program->data_segment);
-                free(program);
-                fclose(file);
-                return NULL;
-            }
-        }
-        
-        // Read data segment data
-        for (uint32_t i = 0; i < program->header.data_size; i++) {
-            if (fgets(line, sizeof(line), file)) {
-                if (sscanf(line, "%x", &program->data_segment[i]) != 1) {
-                    fprintf(stderr, "Error: Invalid data at line %u\n", i);
-                    if (program->code_segment) free(program->code_segment);
-                    free(program->data_segment);
-                    free(program);
-                    fclose(file);
-                    return NULL;
-                }
-            } else {
-                fprintf(stderr, "Error: Unexpected end of file in data section\n");
-                if (program->code_segment) free(program->code_segment);
-                free(program->data_segment);
-                free(program);
-                fclose(file);
-                return NULL;
-            }
-        }
     } else {
         program->data_segment = NULL;
     }
     
-    fclose(file);
-    printf("Program '%s' loaded: CODE=%u words, DATA=%u words\n",
+    if (!program->code_segment || (program->header.data_size > 0 && !program->data_segment)) {
+        fprintf(stderr, "Error: Failed to allocate segments\n");
+        free(full_program);
+        free(program->code_segment);
+        free(program->data_segment);
+        free(program);
+        return NULL;
+    }
+    
+    // Copy data to segments
+    memcpy(program->code_segment, full_program, sizeof(uint32_t) * program->header.code_size);
+    if (program->header.data_size > 0) {
+        memcpy(program->data_segment, full_program + program->header.code_size, 
+               sizeof(uint32_t) * program->header.data_size);
+    }
+    
+    free(full_program);
+    
+    printf("[Loader] ELF Program '%s' loaded: CODE=%u words @0x%06X, DATA=%u words @0x%06X\n",
            program->header.program_name, 
-           program->header.code_size, 
-           program->header.data_size);
+           program->header.code_size, text_addr,
+           program->header.data_size, data_addr);
     
     return program;
 }
@@ -260,15 +220,20 @@ PCB* create_process_from_program(Loader* loader, Program* program) {
     set_pcb_priority(pcb, program->header.priority);
     set_pcb_ttl(pcb, program->header.ttl);
     
-    // Calculate memory requirements
-    uint32_t code_size_bytes = program->header.code_size * WORD_SIZE;
-    uint32_t data_size_bytes = program->header.data_size * WORD_SIZE;
-    uint32_t code_pages = calculate_pages_needed(code_size_bytes);
-    uint32_t data_pages = calculate_pages_needed(data_size_bytes);
-    uint32_t total_pages = code_pages + data_pages;
+    // Calculate the total memory span needed
+    // .text and .data contain WORD offsets from the .elf file
+    uint32_t code_start_word = program->header.text_address / WORD_SIZE;  // Should be 0
+    uint32_t code_end_word = code_start_word + program->header.code_size;
+    uint32_t data_start_word = program->header.data_address / WORD_SIZE;
+    uint32_t data_end_word = data_start_word + program->header.data_size;
     
-    printf("Process %d: Requires %u pages (code=%u, data=%u)\n", 
-           pcb->pid, total_pages, code_pages, data_pages);
+    // The total address space is from word 0 to the end of data
+    uint32_t total_words = (data_end_word > code_end_word) ? data_end_word : code_end_word;
+    uint32_t total_bytes = total_words * WORD_SIZE;
+    uint32_t total_pages = calculate_pages_needed(total_bytes);
+    
+    printf("[Loader] Process %d: Memory layout - CODE: words 0x%X-0x%X, DATA: words 0x%X-0x%X, Total: %u pages\n", 
+           pcb->pid, code_start_word, code_end_word-1, data_start_word, data_end_word-1, total_pages);
     
     // Create page table in kernel space
     PageTableEntry* page_table = create_page_table(pm, total_pages);
@@ -281,93 +246,69 @@ PCB* create_process_from_program(Loader* loader, Program* program) {
     // Set page table base in PCB
     pcb->mm.pgb = (void*)page_table;
     
-    // Set virtual addresses (code starts at virtual address 0)
-    pcb->mm.code = (void*)0;  // Code segment starts at virtual address 0
-    pcb->mm.data = (void*)(code_pages * PAGE_SIZE);  // Data segment follows code
+    // Set virtual addresses (preserve original layout)
+    pcb->mm.code = (void*)(code_start_word * WORD_SIZE);
+    pcb->mm.data = (void*)(data_start_word * WORD_SIZE);
     
-    // Allocate frames and load code segment
-    uint32_t virtual_page = 0;
-    for (uint32_t i = 0; i < code_pages; i++) {
+    // Allocate frames and initialize entire address space
+    uint32_t words_per_page = FRAME_SIZE / WORD_SIZE;
+    
+    for (uint32_t page = 0; page < total_pages; page++) {
         uint32_t frame = allocate_frame(pm);
         if (frame == 0) {
-            fprintf(stderr, "Error: Failed to allocate frame for code page %u\n", i);
+            fprintf(stderr, "Error: Failed to allocate frame for page %u\n", page);
             // TODO: Cleanup allocated frames
             destroy_pcb(pcb);
             return NULL;
         }
         
         // Update page table entry
-        page_table[virtual_page].frame_number = frame;
-        page_table[virtual_page].present = 1;
-        page_table[virtual_page].rw = 0;  // Code is read-only
-        page_table[virtual_page].user = 1;
+        page_table[page].frame_number = frame;
+        page_table[page].present = 1;
+        page_table[page].rw = 1;  // Allow read-write for simplicity
+        page_table[page].user = 1;
         
-        // Copy code data to physical memory
-        uint32_t frame_address = frame * (FRAME_SIZE / WORD_SIZE);  // Convert to word address
-        uint32_t words_to_copy = (i < code_pages - 1) ? 
-                                 (FRAME_SIZE / WORD_SIZE) : 
-                                 (program->header.code_size - i * (FRAME_SIZE / WORD_SIZE));
+        // Calculate physical frame address
+        uint32_t frame_address = frame * words_per_page;
         
-        for (uint32_t j = 0; j < words_to_copy && (i * (FRAME_SIZE / WORD_SIZE) + j) < program->header.code_size; j++) {
-            write_word(pm, frame_address + j, 
-                      program->code_segment[i * (FRAME_SIZE / WORD_SIZE) + j]);
+        // Initialize this page (fill with zeros first)
+        for (uint32_t j = 0; j < words_per_page; j++) {
+            write_word(pm, frame_address + j, 0);
         }
         
-        virtual_page++;
-    }
-    
-    // Allocate frames and load data segment
-    for (uint32_t i = 0; i < data_pages; i++) {
-        uint32_t frame = allocate_frame(pm);
-        if (frame == 0) {
-            fprintf(stderr, "Error: Failed to allocate frame for data page %u\n", i);
-            // TODO: Cleanup allocated frames
-            destroy_pcb(pcb);
-            return NULL;
+        // Now copy actual code and data to their correct positions
+        uint32_t page_start_word = page * words_per_page;
+        uint32_t page_end_word = page_start_word + words_per_page;
+        
+        // Copy code if it overlaps this page
+        if (code_start_word < page_end_word && code_end_word > page_start_word) {
+            uint32_t copy_start = (code_start_word > page_start_word) ? code_start_word : page_start_word;
+            uint32_t copy_end = (code_end_word < page_end_word) ? code_end_word : page_end_word;
+            
+            for (uint32_t word = copy_start; word < copy_end; word++) {
+                uint32_t code_idx = word - code_start_word;
+                uint32_t offset_in_page = word - page_start_word;
+                write_word(pm, frame_address + offset_in_page, program->code_segment[code_idx]);
+            }
         }
         
-        // Update page table entry
-        page_table[virtual_page].frame_number = frame;
-        page_table[virtual_page].present = 1;
-        page_table[virtual_page].rw = 1;  // Data is read-write
-        page_table[virtual_page].user = 1;
-        
-        // Copy data to physical memory
-        uint32_t frame_address = frame * (FRAME_SIZE / WORD_SIZE);  // Convert to word address
-        uint32_t words_to_copy = (i < data_pages - 1) ? 
-                                 (FRAME_SIZE / WORD_SIZE) : 
-                                 (program->header.data_size - i * (FRAME_SIZE / WORD_SIZE));
-        
-        for (uint32_t j = 0; j < words_to_copy && (i * (FRAME_SIZE / WORD_SIZE) + j) < program->header.data_size; j++) {
-            write_word(pm, frame_address + j, 
-                      program->data_segment[i * (FRAME_SIZE / WORD_SIZE) + j]);
+        // Copy data if it overlaps this page
+        if (data_start_word < page_end_word && data_end_word > page_start_word) {
+            uint32_t copy_start = (data_start_word > page_start_word) ? data_start_word : page_start_word;
+            uint32_t copy_end = (data_end_word < page_end_word) ? data_end_word : page_end_word;
+            
+            for (uint32_t word = copy_start; word < copy_end; word++) {
+                uint32_t data_idx = word - data_start_word;
+                uint32_t offset_in_page = word - page_start_word;
+                write_word(pm, frame_address + offset_in_page, program->data_segment[data_idx]);
+            }
         }
-        
-        virtual_page++;
     }
     
     loader->total_loaded++;
-    printf("Process %d created: '%s' (priority=%d, ttl=%d, pages=%u)\n",
+    printf("[Loader] Process %d created: '%s' (priority=%d, ttl=%d, pages=%u)\n",
            pcb->pid, program->header.program_name, 
            pcb->priority, pcb->ttl, total_pages);
-    
-    return pcb;
-}
-
-// Load program from file and create process
-PCB* load_and_create_process(Loader* loader, const char* filename) {
-    // Load program from file
-    Program* program = load_program_from_file(filename);
-    if (!program) {
-        fprintf(stderr, "Error: Failed to load program from '%s'\n", filename);
-        return NULL;
-    }
-    
-    // Create process from program
-    PCB* pcb = create_process_from_program(loader, program);
-    
-    // Free program structure (data is now in physical memory)
-    destroy_program(program);
     
     return pcb;
 }

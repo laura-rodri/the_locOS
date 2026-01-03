@@ -185,3 +185,71 @@ void destroy_page_table(PhysicalMemory* pm, PageTableEntry* page_table, uint32_t
     // In a real OS, kernel space would have its own allocation/deallocation
     // For this simulation, kernel space is simply a sequential allocator
 }
+
+// MMU: Translate virtual address to physical address
+// Virtual Address = [Virtual Page Number | Offset]
+// Physical Address = [Physical Frame Number | Offset]
+uint32_t translate_virtual_to_physical(PhysicalMemory* pm, PageTableEntry* page_table, 
+                                       uint32_t virtual_address) {
+    if (!pm || !page_table) {
+        fprintf(stderr, "Error: Invalid PM or page table in MMU translation\n");
+        return 0;
+    }
+    
+    // Extract virtual page number and offset
+    uint32_t offset = virtual_address & ((1 << PAGE_OFFSET_BITS) - 1);  // Lower 12 bits
+    uint32_t virtual_page = virtual_address >> PAGE_OFFSET_BITS;         // Upper bits
+    
+    // Check if page is present in memory
+    if (!page_table[virtual_page].present) {
+        fprintf(stderr, "Error: Page fault! Virtual page %u not present in memory\n", virtual_page);
+        return 0;
+    }
+    
+    // Get physical frame number from page table
+    uint32_t frame_number = page_table[virtual_page].frame_number;
+    
+    // Calculate physical address (in bytes)
+    uint32_t physical_address_bytes = (frame_number << PAGE_OFFSET_BITS) | offset;
+    
+    // Convert to word address
+    uint32_t physical_address_words = physical_address_bytes / WORD_SIZE;
+    
+    return physical_address_words;
+}
+
+// MMU: Read a word using virtual address
+uint32_t mmu_read_word(PhysicalMemory* pm, PageTableEntry* page_table, 
+                       uint32_t virtual_address) {
+    if (!pm || !page_table) {
+        fprintf(stderr, "Error: Invalid PM or page table in MMU read\n");
+        return 0;
+    }
+    
+    // Translate virtual address to physical address
+    uint32_t physical_address = translate_virtual_to_physical(pm, page_table, virtual_address);
+    
+    // Read from physical memory
+    return read_word(pm, physical_address);
+}
+
+// MMU: Write a word using virtual address
+void mmu_write_word(PhysicalMemory* pm, PageTableEntry* page_table, 
+                    uint32_t virtual_address, uint32_t value) {
+    if (!pm || !page_table) {
+        fprintf(stderr, "Error: Invalid PM or page table in MMU write\n");
+        return;
+    }
+    
+    // Translate virtual address to physical address
+    uint32_t physical_address = translate_virtual_to_physical(pm, page_table, virtual_address);
+    
+    // Extract virtual page number to mark as dirty
+    uint32_t virtual_page = virtual_address >> PAGE_OFFSET_BITS;
+    page_table[virtual_page].dirty = 1;
+    page_table[virtual_page].accessed = 1;
+    
+    // Write to physical memory
+    write_word(pm, physical_address, value);
+}
+

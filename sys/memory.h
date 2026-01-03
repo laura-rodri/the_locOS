@@ -68,4 +68,12 @@ void write_word(PhysicalMemory* pm, uint32_t address, uint32_t value);
 PageTableEntry* create_page_table(PhysicalMemory* pm, uint32_t num_pages);
 void destroy_page_table(PhysicalMemory* pm, PageTableEntry* page_table, uint32_t num_pages);
 
+// MMU - Address Translation
+uint32_t translate_virtual_to_physical(PhysicalMemory* pm, PageTableEntry* page_table, 
+                                       uint32_t virtual_address);
+uint32_t mmu_read_word(PhysicalMemory* pm, PageTableEntry* page_table, 
+                       uint32_t virtual_address);
+void mmu_write_word(PhysicalMemory* pm, PageTableEntry* page_table, 
+                    uint32_t virtual_address, uint32_t value);
+
 #endif // MEMORY_H

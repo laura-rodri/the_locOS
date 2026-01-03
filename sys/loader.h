@@ -20,6 +20,8 @@ typedef struct {
     char program_name[MAX_PROGRAM_NAME];
     uint32_t code_size;      // Size of code segment in words
     uint32_t data_size;      // Size of data segment in words
+    uint32_t text_address;   // Virtual address where .text section starts (in bytes)
+    uint32_t data_address;   // Virtual address where .data section starts (in bytes)
     uint32_t entry_point;    // Entry point (virtual address relative to code segment)
     uint32_t priority;       // Process priority
     uint32_t ttl;            // Time to live
@@ -47,15 +49,12 @@ Loader* create_loader(PhysicalMemory* pm, ProcessQueue* ready_queue,
                       Machine* machine, Scheduler* scheduler);
 void destroy_loader(Loader* loader);
 
-// Program loading
-Program* load_program_from_file(const char* filename);
+// Program loading (prometheus .elf format)
+Program* load_program_from_elf(const char* filename);
 void destroy_program(Program* program);
 
 // Process creation from program
 PCB* create_process_from_program(Loader* loader, Program* program);
-
-// Load program into memory and create process
-PCB* load_and_create_process(Loader* loader, const char* filename);
 
 // Helper function to calculate number of pages needed
 uint32_t calculate_pages_needed(uint32_t size_in_bytes);

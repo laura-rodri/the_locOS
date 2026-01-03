@@ -28,6 +28,13 @@ PCB* create_pcb(int pid) {
     pcb->mm.data = NULL;
     pcb->mm.pgb = NULL;
     
+    // Initialize execution context
+    pcb->context.pc = 0;
+    pcb->context.instruction = 0;
+    for (int i = 0; i < 16; i++) {
+        pcb->context.registers[i] = 0;
+    }
+    
     return pcb;
 }
 
@@ -256,7 +263,7 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
                                           int min_ttl, int max_ttl,
                                           ProcessQueue* ready_queue,
                                           Machine* machine, Scheduler* scheduler,
-                                          int max_processes) {
+                                          int max_processes, int start_pid) {
     if (!ready_queue || min_interval < 1 || max_interval < min_interval || 
         min_ttl < 1 || max_ttl < min_ttl || max_processes < 1) {
         fprintf(stderr, "Invalid process generator parameters\n");
@@ -275,7 +282,7 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
     pg->scheduler = scheduler;
     pg->max_processes = max_processes;
     pg->running = 0;
-    pg->next_pid = 1;  // PIDs start from 1
+    pg->next_pid = start_pid;  // Start from provided PID
     pg->total_generated = 0;
     
     return pg;
@@ -572,9 +579,13 @@ void* scheduler_function(void* arg) {
                 for (int j = 0; j < sched->machine->cpus[i].num_cores && running; j++) {
                     Core* core = &sched->machine->cpus[i].cores[j];
                     
-                    // Process each PCB in this core (iterate backwards to safely remove)
+                    // Process each hardware thread in this core (iterate backwards to safely remove)
                     for (int k = core->current_pcb_count - 1; k >= 0 && running; k--) {
-                        PCB* pcb = &core->pcbs[k];
+                        HardwareThread* hw_thread = &core->hw_threads[k];
+                        PCB* pcb = hw_thread->pcb;
+                        
+                        // Skip if no PCB assigned
+                        if (!pcb) continue;
                         
                         // Increment quantum counter (TTL is decremented by clock!)
                         pcb->quantum_counter++;
@@ -583,18 +594,43 @@ void* scheduler_function(void* arg) {
                                i, j, k, pcb->pid, pcb->ttl, pcb->quantum_counter, sched->quantum);
                         fflush(stdout);
                         
-                        // Check if process completed (TTL reached 0)
-                        if (pcb->ttl <= 0) {
+                        // Check if process terminated (by EXIT instruction or TTL reached 0)
+                        if (pcb->state == TERMINATED || pcb->ttl <= 0) {
                             // Process completed
-                            printf("[Scheduler] Process PID=%d COMPLETED - removing from CPU%d-Core%d-Thread%d\n", 
-                                   pcb->pid, i, j, k);
+                            const char* reason = (pcb->state == TERMINATED) ? "EXIT" : "TTL=0";
+                            printf("[Scheduler] Process PID=%d COMPLETED (%s) - removing from CPU%d-Core%d-Thread%d\n", 
+                                   pcb->pid, reason, i, j, k);
                             fflush(stdout);
                             __sync_fetch_and_add(&sched->total_completed, 1);
                             
-                            // Remove from core by shifting
+                            // Free the PCB and its resources (page table, etc.)
+                            if (pcb->mm.pgb) {
+                                // Note: In a real system, we should free the page table and allocated frames
+                                // For now, just mark as freed (memory leak, but acceptable for simulation)
+                                pcb->mm.pgb = NULL;
+                            }
+                            
+                            // Destroy the PCB
+                            destroy_pcb(pcb);
+                            
+                            // Clear hardware thread
+                            hw_thread->pcb = NULL;
+                            hw_thread->PTBR = NULL;
+                            hw_thread->PC = 0;
+                            hw_thread->IR = 0;
+                            hw_thread->mmu.page_table_base = NULL;
+                            hw_thread->mmu.enabled = 0;
+                            
+                            // Shift remaining hardware threads and PCBs
                             for (int l = k; l < core->current_pcb_count - 1; l++) {
+                                core->hw_threads[l] = core->hw_threads[l + 1];
                                 core->pcbs[l] = core->pcbs[l + 1];
                             }
+                            
+                            // Clear the last one
+                            core->hw_threads[core->current_pcb_count - 1].pcb = NULL;
+                            core->hw_threads[core->current_pcb_count - 1].PTBR = NULL;
+                            
                             core->current_pcb_count--;
                             
                         } else if (pcb->quantum_counter >= sched->quantum) {
@@ -603,41 +639,58 @@ void* scheduler_function(void* arg) {
                                    pcb->pid, i, j, k);
                             fflush(stdout);
                             
-                            // Create a copy for the ready queue
-                            PCB* ready_pcb = create_pcb(pcb->pid);
-                            if (ready_pcb) {
-                                ready_pcb->state = WAITING;
-                                ready_pcb->priority = pcb->priority;
-                                ready_pcb->ttl = pcb->ttl;
-                                ready_pcb->initial_ttl = pcb->initial_ttl;
-                                ready_pcb->quantum_counter = 0;  // Reset quantum counter
-                                
-                                // Calculate virtual deadline for BFS
-                                if (sched->policy == SCHED_POLICY_BFS) {
-                                    // deadline = T_actual + offset
-                                    // offset = rodaja_de_tiempo * prioridad / 100
-                                    int offset = (sched->quantum * ready_pcb->priority) / 100;
-                                    int current_tick = clk_counter;  // Use clk_counter directly since we have mutex
-                                    ready_pcb->virtual_deadline = current_tick + offset;
-                                    printf("[Scheduler] BFS: Process PID=%d virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
-                                           ready_pcb->pid, ready_pcb->virtual_deadline, current_tick, offset, ready_pcb->priority);
-                                    fflush(stdout);
-                                }
-                                
-                                enqueue_to_scheduler(sched, ready_pcb);
-                                
-                                // EVENT: Process returned to queue - this is an event
-                                // For preemptive priority, check if higher priority processes are waiting
-                                if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
-                                    // Signal that queue state changed - scheduler will handle reassignment
-                                    pthread_cond_broadcast(&clk_cond);
-                                }
+                            // Save hardware thread context to PCB BEFORE clearing
+                            HardwareThread* hw_thread = &core->hw_threads[k];
+                            pcb->context.pc = hw_thread->PC;
+                            pcb->context.instruction = hw_thread->IR;
+                            for (int r = 0; r < 16; r++) {
+                                pcb->context.registers[r] = hw_thread->registers[r];
                             }
                             
-                            // Remove from core
+                            // Move the ORIGINAL PCB back to ready queue (don't create a copy)
+                            // This preserves all memory management state
+                            pcb->state = WAITING;
+                            pcb->quantum_counter = 0;  // Reset quantum counter
+                            
+                            // Calculate virtual deadline for BFS
+                            if (sched->policy == SCHED_POLICY_BFS) {
+                                // deadline = T_actual + offset
+                                // offset = rodaja_de_tiempo * prioridad / 100
+                                int offset = (sched->quantum * pcb->priority) / 100;
+                                int current_tick = clk_counter;  // Use clk_counter directly since we have mutex
+                                pcb->virtual_deadline = current_tick + offset;
+                                printf("[Scheduler] BFS: Process PID=%d virtual_deadline=%d (tick=%d, offset=%d, prio=%d)\n",
+                                       pcb->pid, pcb->virtual_deadline, current_tick, offset, pcb->priority);
+                                fflush(stdout);
+                            }
+                            
+                            enqueue_to_scheduler(sched, pcb);
+                            
+                            // EVENT: Process returned to queue - this is an event
+                            // For preemptive priority, check if higher priority processes are waiting
+                            if (sched->policy == SCHED_POLICY_PREEMPTIVE_PRIO) {
+                                // Signal that queue state changed - scheduler will handle reassignment
+                                pthread_cond_broadcast(&clk_cond);
+                            }
+                            
+                            // Remove from core by clearing the hardware thread
+                            hw_thread->pcb = NULL;
+                            hw_thread->PTBR = NULL;
+                            hw_thread->PC = 0;
+                            hw_thread->IR = 0;
+                            hw_thread->mmu.page_table_base = NULL;
+                            hw_thread->mmu.enabled = 0;
+                            
+                            // Shift remaining hardware threads
                             for (int l = k; l < core->current_pcb_count - 1; l++) {
+                                core->hw_threads[l] = core->hw_threads[l + 1];
                                 core->pcbs[l] = core->pcbs[l + 1];
                             }
+                            
+                            // Clear the last one
+                            core->hw_threads[core->current_pcb_count - 1].pcb = NULL;
+                            core->hw_threads[core->current_pcb_count - 1].PTBR = NULL;
+                            
                             core->current_pcb_count--;
                         }
                     }
@@ -698,8 +751,8 @@ void* scheduler_function(void* arg) {
                     }
                     fflush(stdout);
                     
-                    // Free the original PCB since assign_process_to_core makes a copy
-                    destroy_pcb(pcb);
+                    // DO NOT free the PCB - it's still being used by the hardware thread
+                    // The PCB will be freed when the process completes or is removed
                 } else {
                     // Couldn't assign - put back in queue
                     enqueue_to_scheduler(sched, pcb);

@@ -3,10 +3,13 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "machine.h"
 #include "process.h"
 #include "clock_sys.h"
 #include "timer.h"
+#include "memory.h"
+#include "loader.h"
 
 // Global variables for cleanup
 static pthread_t clk_thread_global;
@@ -16,6 +19,8 @@ static ProcessGenerator* proc_gen_global = NULL;
 static Scheduler* scheduler_global = NULL;
 static ProcessQueue* ready_queue_global = NULL;
 static Machine* machine_global = NULL;
+static PhysicalMemory* physical_memory_global = NULL;
+static Loader* loader_global = NULL;
 volatile int running = 1;  // Flag to control main loop and system components
 
 // Timer callback function - activates the scheduler
@@ -109,6 +114,8 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         destroy_scheduler(scheduler_global);
     }
     
+    // ProcessGenerator disabled - using only .elf programs
+    /*
     printf("Stopping process generator...\n");
     fflush(stdout);
     
@@ -117,6 +124,7 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         stop_process_generator(proc_gen_global);
         destroy_process_generator(proc_gen_global);
     }
+    */
     
     printf("Stopping clock...\n");
     fflush(stdout);
@@ -171,6 +179,36 @@ void cleanup_system(pthread_t clock_thread, Timer** timers, int num_timers) {
         printf("Destroying machine...\n");
         fflush(stdout);
         destroy_machine(machine_global);
+    }
+    
+    // Destroy loader
+    if (loader_global) {
+        printf("Destroying loader...\n");
+        fflush(stdout);
+        destroy_loader(loader_global);
+    }
+    
+    // Destroy physical memory
+    if (physical_memory_global) {
+        printf("Destroying physical memory...\n");
+        fflush(stdout);
+        
+        // Show memory usage statistics before destroying
+        printf("\n=== Memory Usage Statistics ===\n");
+        int used_frames = 0;
+        for (int i = 0; i < TOTAL_FRAMES; i++) {
+            if (is_frame_allocated(physical_memory_global, i)) {
+                used_frames++;
+            }
+        }
+        printf("Total frames: %d (%.2f MB)\n", TOTAL_FRAMES, (TOTAL_FRAMES * PAGE_SIZE) / (1024.0 * 1024.0));
+        printf("Used frames: %d (%.2f MB)\n", used_frames, (used_frames * PAGE_SIZE) / (1024.0 * 1024.0));
+        printf("Free frames: %d (%.2f MB)\n", TOTAL_FRAMES - used_frames, ((TOTAL_FRAMES - used_frames) * PAGE_SIZE) / (1024.0 * 1024.0));
+        printf("Memory utilization: %.2f%%\n", (used_frames * 100.0) / TOTAL_FRAMES);
+        printf("==============================\n\n");
+        fflush(stdout);
+        
+        destroy_physical_memory(physical_memory_global);
     }
     
     printf("Destroying mutexes...\n");
@@ -320,6 +358,20 @@ int main(int argc, char *argv[]) {
     // Set machine reference in clock so it can decrement TTL
     set_clock_machine(machine_global);
     
+    // Create physical memory (FASE 2: Required for instruction execution)
+    printf("Creating physical memory...\n");
+    physical_memory_global = create_physical_memory();
+    if (!physical_memory_global) {
+        fprintf(stderr, "Failed to create physical memory\n");
+        destroy_machine(machine_global);
+        destroy_process_queue(ready_queue_global);
+        stop_clock(clk_thread);
+        return 1;
+    }
+    
+    // Set physical memory in clock for instruction execution
+    set_clock_physical_memory(physical_memory_global);
+    
     // Calculate maximum usable kernel threads (limited by qsize)
     int total_threads = num_cpus * num_cores * num_threads;
     int max_usable_threads = (total_threads < ready_queue_size) ? total_threads : ready_queue_size;
@@ -405,11 +457,84 @@ int main(int argc, char *argv[]) {
         num_timers_global = 0;
     }
     
-    // Create process generator with machine and scheduler references
+    // Create loader for .elf programs (FASE 2)
+    printf("Creating loader...\n");
+    loader_global = create_loader(physical_memory_global, ready_queue_global,
+                                  machine_global, scheduler_global);
+    if (!loader_global) {
+        fprintf(stderr, "Failed to create loader\n");
+        destroy_scheduler(scheduler_global);
+        destroy_physical_memory(physical_memory_global);
+        destroy_machine(machine_global);
+        destroy_process_queue(ready_queue_global);
+        if (timers_global) {
+            for (int i = 0; i < num_timers_global; i++) {
+                if (timers_global[i]) {
+                    destroy_timer(timers_global[i]);
+                }
+            }
+            free(timers_global);
+        }
+        stop_clock(clk_thread);
+        return 1;
+    }
+    
+    // Load .elf programs from ~/the_locOS/programs/ directory
+    // Each .elf file becomes ONE complete process with executable code
+    printf("Loading .elf programs from ~/the_locOS/programs/...\n");
+    const char* programs_dir = "/home/launix/the_locOS/programs";
+    DIR* dir = opendir(programs_dir);
+    if (dir) {
+        struct dirent* entry;
+        int programs_loaded = 0;
+        
+        while ((entry = readdir(dir)) != NULL) {
+            // Check if file ends with .elf
+            size_t len = strlen(entry->d_name);
+            if (len > 4 && strcmp(entry->d_name + len - 4, ".elf") == 0) {
+                // Build full path
+                char filepath[512];
+                snprintf(filepath, sizeof(filepath), "%s/%s", programs_dir, entry->d_name);
+                
+                // Load program and create process
+                printf("  Loading %s...\n", entry->d_name);
+                Program* prog = load_program_from_elf(filepath);
+                if (prog) {
+                    PCB* pcb = create_process_from_program(loader_global, prog);
+                    if (pcb) {
+                        // Add to ready queue
+                        if (enqueue_process(ready_queue_global, pcb) == 0) {
+                            programs_loaded++;
+                            printf("    -> Process %d added to ready queue\n", pcb->pid);
+                        } else {
+                            fprintf(stderr, "    -> Failed to enqueue process\n");
+                            destroy_pcb(pcb);
+                        }
+                    }
+                    destroy_program(prog);
+                } else {
+                    fprintf(stderr, "    -> Failed to load program\n");
+                }
+            }
+        }
+        closedir(dir);
+        
+        printf("Loaded %d programs from .elf files\n", programs_loaded);
+    } else {
+        fprintf(stderr, "Warning: Could not open programs directory '%s'\n", programs_dir);
+        fprintf(stderr, "No .elf programs will be loaded\n");
+    }
+    
+    // Process generator DISABLED - Using only .elf programs with real executable code
+    // ProcessGenerator creates dummy processes without memory (PTBR not initialized)
+    // Only .elf files create complete processes with code, data, and page tables
+    /*
+    int start_pid = loader_global ? loader_global->next_pid : 1;
     proc_gen_global = create_process_generator(proc_gen_min, proc_gen_max, 
                                                proc_ttl_min, proc_ttl_max,
                                                ready_queue_global, machine_global,
-                                               scheduler_global, ready_queue_size);
+                                               scheduler_global, ready_queue_size,
+                                               start_pid);
     if (!proc_gen_global) {
         fprintf(stderr, "Failed to create process generator\n");
         destroy_scheduler(scheduler_global);
@@ -426,6 +551,9 @@ int main(int argc, char *argv[]) {
         stop_clock(clk_thread);
         return 1;
     }
+    */
+    proc_gen_global = NULL;  // No process generator - only .elf programs
+    printf("Process creation: .elf programs only (ProcessGenerator disabled)\n");
     
     // Print system configuration BEFORE starting components
     const char* policy_names[] = {"Round Robin", "BFS", "Preemptive Priority"};
@@ -475,8 +603,8 @@ int main(int argc, char *argv[]) {
                queue_capacity, total_capacity, ready_queue_size);
     }
     
-    // Start process generator and scheduler
-    start_process_generator(proc_gen_global);
+    // Start scheduler only - ProcessGenerator disabled (using .elf programs only)
+    // start_process_generator(proc_gen_global);
     start_scheduler(scheduler_global);
 
     printf("\n\033[32m=== Running system ===\033[0m\n");

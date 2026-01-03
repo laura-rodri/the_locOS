@@ -2,6 +2,7 @@
 #define PROCESS_H
 
 #include <pthread.h>
+#include <stdint.h>
 
 // Global flag to control system execution
 extern volatile int running;
@@ -27,6 +28,13 @@ typedef struct {
     void* pgb;              // Physical address of page table base
 } MemoryManagement;
 
+// Execution Context (saved when process is preempted)
+typedef struct {
+    uint32_t pc;            // Program Counter
+    uint32_t instruction;   // Current instruction register
+    uint32_t registers[16]; // General purpose registers
+} ExecutionContext;
+
 // Process Control Block
 typedef struct {
     int pid;
@@ -37,6 +45,7 @@ typedef struct {
     int quantum_counter;    // Current quantum usage
     int virtual_deadline;   // Virtual deadline for BFS scheduling
     MemoryManagement mm;    // Memory management information
+    ExecutionContext context;  // Saved execution context
     // etc - extend as needed
 } PCB;
 
@@ -110,7 +119,7 @@ ProcessGenerator* create_process_generator(int min_interval, int max_interval,
                                            int min_ttl, int max_ttl,
                                            ProcessQueue* ready_queue,
                                            Machine* machine, Scheduler* scheduler,
-                                           int max_processes);
+                                           int max_processes, int start_pid);
 void start_process_generator(ProcessGenerator* pg);
 void stop_process_generator(ProcessGenerator* pg);
 void destroy_process_generator(ProcessGenerator* pg);

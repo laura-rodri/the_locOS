@@ -38,6 +38,7 @@ typedef struct {
     uint32_t PC;            // Program Counter
     uint32_t IR;            // Instruction Register
     void* PTBR;             // Page Table Base Register
+    uint32_t registers[16]; // General purpose registers r0-r15
     
     // Memory management hardware
     MMU mmu;                // Memory Management Unit
@@ -78,5 +79,9 @@ int can_cpu_execute_process(Machine* machine);  // Returns 1 if any core has spa
 int assign_process_to_core(Machine* machine, PCB* pcb);  // Assign process to first available core
 int remove_process_from_core(Machine* machine, int pid);  // Remove process from core by PID
 int count_executing_processes(Machine* machine);  // Count total executing processes
+
+// Instruction execution
+#include "memory.h"
+void execute_instruction_cycle(HardwareThread* hw_thread, PhysicalMemory* pm);
 
 #endif // MACHINE_H
