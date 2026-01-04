@@ -180,10 +180,6 @@ void destroy_page_table(PhysicalMemory* pm, PageTableEntry* page_table, uint32_t
             free_frame(pm, page_table[i].frame_number);
         }
     }
-    
-    // Note: We don't free the page table itself from kernel space
-    // In a real OS, kernel space would have its own allocation/deallocation
-    // For this simulation, kernel space is simply a sequential allocator
 }
 
 // MMU: Translate virtual address to physical address

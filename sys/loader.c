@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Create a new loader
 Loader* create_loader(PhysicalMemory* pm, ProcessQueue* ready_queue, 
@@ -64,8 +65,8 @@ Program* load_program_from_elf(const char* filename) {
     
     // Default values
     program->header.entry_point = 0;
-    program->header.priority = 0;
-    program->header.ttl = 50;  // Default TTL
+    program->header.priority = 0;  // Will be set later based on program size
+    program->header.ttl = 50;  // Will be set later based on program size
     program->header.text_address = 0;  // Will be set from .text directive
     program->header.data_address = 0;  // Will be set from .data directive
     
@@ -114,6 +115,24 @@ Program* load_program_from_elf(const char* filename) {
         program->header.code_size = total_words;
         program->header.data_size = 0;
     }
+    
+    // Assign random priority: -20 (highest) to 19 (lowest)
+    // Use a better seed combining time, address, and code size for variety
+    static unsigned int seed_counter = 0;
+    srand((unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)file ^ seed_counter++ ^ program->header.code_size);
+    program->header.priority = MIN_PRIORITY + (rand() % NUM_PRIORITY_LEVELS);
+    
+    // Calculate realistic TTL based on code size
+    // Estimate: ~2-3 ticks per instruction on average, with some margin
+    // For small programs: minimum 10 ticks, maximum 100 ticks
+    int estimated_ttl = program->header.code_size * 3;
+    if (estimated_ttl < 10) estimated_ttl = 10;
+    if (estimated_ttl > 100) estimated_ttl = 100;
+    program->header.ttl = estimated_ttl;
+    
+    printf("[Loader] Program '%s': code_size=%u words, priority=%d, TTL=%u ticks\n",
+           program->header.program_name, program->header.code_size, 
+           program->header.priority, program->header.ttl);
     
     // Allocate one contiguous segment for the entire program
     // This makes it easier to load into virtual memory

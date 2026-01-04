@@ -587,11 +587,20 @@ void* scheduler_function(void* arg) {
                         // Skip if no PCB assigned
                         if (!pcb) continue;
                         
-                        // Increment quantum counter (TTL is decremented by clock!)
+                        // Increment quantum counter
+                        // - CLOCK mode: called every tick, count ticks until quantum expires
+                        // - TIMER mode: called when timer fires (every timer_interval ticks)
                         pcb->quantum_counter++;
                         
-                        printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d (TTL=%d, quantum=%d/%d)\n", 
-                               i, j, k, pcb->pid, pcb->ttl, pcb->quantum_counter, sched->quantum);
+                        if (sched->sync_mode == SCHED_SYNC_TIMER) {
+                            // In TIMER mode: timer fires periodically, quantum = timer interval
+                            printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d (TTL=%d, quantum expired)\n", 
+                                   i, j, k, pcb->pid, pcb->ttl);
+                        } else {
+                            // In CLOCK mode: activated every tick, show quantum progress
+                            printf("[Scheduler] CPU%d-Core%d-Thread%d: Process PID=%d (TTL=%d, quantum=%d/%d)\n", 
+                                   i, j, k, pcb->pid, pcb->ttl, pcb->quantum_counter, sched->quantum);
+                        }
                         fflush(stdout);
                         
                         // Check if process terminated (by EXIT instruction or TTL reached 0)
@@ -633,8 +642,10 @@ void* scheduler_function(void* arg) {
                             
                             core->current_pcb_count--;
                             
-                        } else if (pcb->quantum_counter >= sched->quantum) {
-                            // Quantum expired - return to ready queue
+                        } else if ((sched->sync_mode == SCHED_SYNC_TIMER && pcb->quantum_counter >= 1) ||
+                                   (sched->sync_mode == SCHED_SYNC_CLOCK && pcb->quantum_counter >= sched->quantum)) {
+                            // TIMER mode: quantum = timer interval, expires when timer fires (counter >= 1)
+                            // CLOCK mode: quantum counted in ticks, expires after 'quantum' ticks
                             printf("[Scheduler] Process PID=%d quantum expired - moving from CPU%d-Core%d-Thread%d to READY\n", 
                                    pcb->pid, i, j, k);
                             fflush(stdout);

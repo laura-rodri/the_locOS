@@ -482,7 +482,7 @@ int main(int argc, char *argv[]) {
     // Load .elf programs from ~/the_locOS/programs/ directory
     // Each .elf file becomes ONE complete process with executable code
     printf("Loading .elf programs from ~/the_locOS/programs/...\n");
-    const char* programs_dir = "/home/launix/the_locOS/programs";
+    const char* programs_dir = "./../programs";
     DIR* dir = opendir(programs_dir);
     if (dir) {
         struct dirent* entry;
@@ -490,8 +490,7 @@ int main(int argc, char *argv[]) {
         
         while ((entry = readdir(dir)) != NULL) {
             // Check if file ends with .elf
-            size_t len = strlen(entry->d_name);
-            if (len > 4 && strcmp(entry->d_name + len - 4, ".elf") == 0) {
+            if (strlen(entry->d_name) > 4 && strcmp(entry->d_name + strlen(entry->d_name) - 4, ".elf") == 0) {
                 // Build full path
                 char filepath[512];
                 snprintf(filepath, sizeof(filepath), "%s/%s", programs_dir, entry->d_name);
@@ -505,7 +504,7 @@ int main(int argc, char *argv[]) {
                         // Add to ready queue
                         if (enqueue_process(ready_queue_global, pcb) == 0) {
                             programs_loaded++;
-                            printf("    -> Process %d added to ready queue\n", pcb->pid);
+                            printf("  %s  -> Process %d added to ready queue\n", entry->d_name, pcb->pid);
                         } else {
                             fprintf(stderr, "    -> Failed to enqueue process\n");
                             destroy_pcb(pcb);
@@ -519,7 +518,7 @@ int main(int argc, char *argv[]) {
         }
         closedir(dir);
         
-        printf("Loaded %d programs from .elf files\n", programs_loaded);
+        printf("[Loader] %d programs loaded from .elf files\n", programs_loaded);
     } else {
         fprintf(stderr, "Warning: Could not open programs directory '%s'\n", programs_dir);
         fprintf(stderr, "No .elf programs will be loaded\n");
@@ -612,7 +611,7 @@ int main(int argc, char *argv[]) {
     
     // Wait for signal using pause() which will be interrupted by SIGINT
     while (running) {
-        pause();  // Blocks until a signal is received
+        pause();
     }
     
     // Cleanup

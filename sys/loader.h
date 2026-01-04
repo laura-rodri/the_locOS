@@ -7,9 +7,8 @@
 
 // Program file format
 // A program file contains:
-// 1. Header with metadata (code size, data size, etc.)
-// 2. .text section (code segment)
-// 3. .data section (data segment)
+// 1. .text section (code segment)
+// 2. .data section (data segment)
 
 #define MAX_PROGRAM_NAME 256
 #define MAX_CODE_SIZE 4096  // Maximum code segment size in words

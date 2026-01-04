@@ -9,7 +9,9 @@
     1. [ ] ahorcado  
 1. [ ] parte 4: gestor de memoria
     - fase 1
-        - [ ] convertir Process Generator en Loader
-        - [ ] memoria virtual
+        - [x] convertir Process Generator en Loader
+        - [x] memoria virtual
     - fase 2
-1. [ ] parte 5: memoria
+        - [x] generar programas con prometheus
+        - [x] interpretarlos y asignarles PCB + memoria
+1. [ ] parte 5: documentación
