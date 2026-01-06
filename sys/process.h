@@ -51,7 +51,7 @@ typedef struct {
 
 // Queue for managing processes
 typedef struct {
-    struct PCB** queue;
+    PCB** queue;
     int front;
     int rear;
     int max_capacity;

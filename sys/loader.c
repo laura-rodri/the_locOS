@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 // Create a new loader
 Loader* create_loader(PhysicalMemory* pm, ProcessQueue* ready_queue, 
@@ -266,8 +267,8 @@ PCB* create_process_from_program(Loader* loader, Program* program) {
     pcb->mm.pgb = (void*)page_table;
     
     // Set virtual addresses (preserve original layout)
-    pcb->mm.code = (void*)(code_start_word * WORD_SIZE);
-    pcb->mm.data = (void*)(data_start_word * WORD_SIZE);
+    pcb->mm.code = (void*)(uintptr_t)(code_start_word * WORD_SIZE);
+    pcb->mm.data = (void*)(uintptr_t)(data_start_word * WORD_SIZE);
     
     // Allocate frames and initialize entire address space
     uint32_t words_per_page = FRAME_SIZE / WORD_SIZE;
