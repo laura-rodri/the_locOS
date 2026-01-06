@@ -1,5 +1,5 @@
 #include "timer.h"
-#include "clock_sys.h"
+#include "clock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,31 +11,41 @@ void* timer_function(void* arg) {
     while (timer->running && running) {
         pthread_mutex_lock(&clk_mutex);
         
-        // Wait for enough clock ticks to pass since last interruption
-        while (timer->running && running && (clk_counter - timer->last_tick) < timer->interval) {
-            pthread_cond_wait(&clk_cond, &clk_mutex);
-        }
+        // Patrón R: Esperar tick del reloj (cond_wait)
+        pthread_cond_wait(&clk_cond, &clk_mutex);
         
         if (!timer->running || !running) {
+            // Señalizar antes de salir para no bloquear al reloj
+            pthread_cond_broadcast(&clk_cond2);
             pthread_mutex_unlock(&clk_mutex);
             break;
         }
         
-        // Generate timer interruption
-        timer->last_tick = clk_counter;
-        
-        // Only print message if timer doesn't have a callback (not used for scheduler sync)
-        if (!timer->callback) {
-            printf("[Timer] Timer %d interrupted at tick %d (interval=%d)\n", 
-                   timer->id, clk_counter, timer->interval);
-            fflush(stdout);
-        }
-        
-        pthread_mutex_unlock(&clk_mutex);
-        
-        // Execute callback if provided (outside clk_mutex to avoid deadlock)
-        if (timer->callback) {
-            timer->callback(timer->id, timer->user_data);
+        // Verificar si se cumple el intervalo del timer
+        if ((clk_counter - timer->last_tick) >= timer->interval) {
+            // Generate timer interruption
+            timer->last_tick = clk_counter;
+            
+            // Only print message if timer doesn't have a callback (not used for scheduler sync)
+            if (!timer->callback) {
+                printf("[Timer] Timer %d interrupted at tick %d (interval=%d)\n", 
+                       timer->id, clk_counter, timer->interval);
+                fflush(stdout);
+            }
+            
+            // Patrón R: Señalizar al reloj que puede continuar (cond_broadcast con cond2)
+            pthread_cond_broadcast(&clk_cond2);
+            
+            pthread_mutex_unlock(&clk_mutex);
+            
+            // Execute callback if provided (outside clk_mutex to avoid deadlock)
+            if (timer->callback) {
+                timer->callback(timer->id, timer->user_data);
+            }
+        } else {
+            // No se cumple el intervalo, pero igual debemos señalizar al reloj
+            pthread_cond_broadcast(&clk_cond2);
+            pthread_mutex_unlock(&clk_mutex);
         }
     }
     return NULL;

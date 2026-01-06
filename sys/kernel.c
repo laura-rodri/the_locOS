@@ -6,7 +6,7 @@
 #include <dirent.h>
 #include "machine.h"
 #include "process.h"
-#include "clock_sys.h"
+#include "clock.h"
 #include "timer.h"
 #include "memory.h"
 #include "loader.h"
@@ -25,6 +25,7 @@ volatile int running = 1;  // Flag to control main loop and system components
 
 // Timer callback function - activates the scheduler
 void timer_scheduler_callback(int timer_id, void* user_data) {
+    (void)timer_id; // Unused parameter
     Scheduler* sched = (Scheduler*)user_data;
     if (sched) {
         // Signal the scheduler to wake up and do its work
@@ -239,10 +240,11 @@ int main(int argc, char *argv[]) {
     int quantum = 3;              // Default quantum (ticks per process)
     int num_timers = 1;           // Default number of timers
     int timer_interval = 5;       // Default timer interval (ticks)
-    int proc_gen_min = 3;         // Default min interval for process generation (ticks)
-    int proc_gen_max = 10;        // Default max interval for process generation (ticks)
-    int proc_ttl_min = 10;        // Default min TTL for processes (ticks)
-    int proc_ttl_max = 50;        // Default max TTL for processes (ticks)
+    // Process generator disabled - these variables are no longer used
+    // int proc_gen_min = 3;         // Default min interval for process generation (ticks)
+    // int proc_gen_max = 10;        // Default max interval for process generation (ticks)
+    // int proc_ttl_min = 10;        // Default min TTL for processes (ticks)
+    // int proc_ttl_max = 50;        // Default max TTL for processes (ticks)
     int ready_queue_size = 100;   // Default ready queue capacity
     int num_cpus = 1;             // Default number of CPUs
     int num_cores = 2;            // Default number of cores per CPU
@@ -260,10 +262,11 @@ int main(int argc, char *argv[]) {
         printf("   -timeri <ticks>    Interval for timer interruptions in ticks (default: 5)\n");
         printf("   -policy <num>      Scheduler policy: 0=RR, 1=BFS, 2=PreemptivePrio (default: 0)\n");
         printf("   -sync <mode>       Sync mode: 0=Clock, 1=Timer (default: 0)\n");
-        printf("   -pgenmin <ticks>   Min interval for process generation in ticks (default: 3)\n");
-        printf("   -pgenmax <ticks>   Max interval for process generation in ticks (default: 10)\n");
-        printf("   -ttlmin <ticks>    Min TTL for processes in ticks (default: 10)\n");
-        printf("   -ttlmax <ticks>    Max TTL for processes in ticks (default: 50)\n");
+        // Process generator disabled - these flags are no longer used
+        // printf("   -pgenmin <ticks>   Min interval for process generation in ticks (default: 3)\n");
+        // printf("   -pgenmax <ticks>   Max interval for process generation in ticks (default: 10)\n");
+        // printf("   -ttlmin <ticks>    Min TTL for processes in ticks (default: 10)\n");
+        // printf("   -ttlmax <ticks>    Max TTL for processes in ticks (default: 50)\n");
         printf("   -qsize <num>       Ready queue size (default: 100)\n");
         printf("   -cpus <num>        Number of CPUs (default: 1)\n");
         printf("   -cores <num>       Number of cores per CPU (default: 2)\n");
@@ -283,7 +286,7 @@ int main(int argc, char *argv[]) {
                 } else if (strcmp(argv[i], "-t")==0) {
                     i++;
                     num_timers = (atoi(argv[i]) >= 0) ? atoi(argv[i]) : 1;
-                } else if (strcmp(argv[i], "-timert")==0) {
+                } else if (strcmp(argv[i], "-timeri")==0) {
                     i++;
                     timer_interval = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 5;
                 } else if (strcmp(argv[i], "-policy")==0) {
@@ -298,6 +301,8 @@ int main(int argc, char *argv[]) {
                     if (sync >= 0 && sync <= 1) {
                         sched_sync = sync;
                     }
+                // Process generator disabled - these flags are ignored
+                /*
                 } else if (strcmp(argv[i], "-pgenmin")==0) {
                     i++;
                     proc_gen_min = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 3;
@@ -310,6 +315,7 @@ int main(int argc, char *argv[]) {
                 } else if (strcmp(argv[i], "-ttlmax")==0) {
                     i++;
                     proc_ttl_max = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 50;
+                */
                 } else if (strcmp(argv[i], "-qsize")==0) {
                     i++;
                     ready_queue_size = (atoi(argv[i]) > 0) ? atoi(argv[i]) : 100;
@@ -394,7 +400,6 @@ int main(int argc, char *argv[]) {
     // Determine how many timers to create:
     // - If sync mode is TIMER: use num_timers, at least 1
     // - If sync mode is CLOCK: create num_timers but they won't affect execution
-//    int timers_to_create = (sched_sync == SCHED_SYNC_TIMER && num_timers < 1) ? 1 : num_timers;
     int timers_to_create = 0;
     if (sched_sync == SCHED_SYNC_TIMER) {
         timers_to_create = (num_timers < 1) ? 1 : num_timers+1;  // +1 for scheduler timer
@@ -576,8 +581,9 @@ int main(int argc, char *argv[]) {
             printf("  - All timers:       interval: %d ticks (no effect on execution)\n", timer_interval);
         }
     }
-    printf("Process gen interval: %d-%d ticks\n", proc_gen_min, proc_gen_max);
-    printf("Process TTL range:    %d-%d ticks\n", proc_ttl_min, proc_ttl_max);
+    // Process generator disabled - info not shown
+    // printf("Process gen interval: %d-%d ticks\n", proc_gen_min, proc_gen_max);
+    // printf("Process TTL range:    %d-%d ticks\n", proc_ttl_min, proc_ttl_max);
     printf("Max processes:        %d (queue size limit)\n", ready_queue_size);
     printf("Machine topology:\n");
     printf("  - CPUs:             %d\n", num_cpus);

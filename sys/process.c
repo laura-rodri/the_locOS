@@ -1,5 +1,5 @@
 #include "process.h"
-#include "clock_sys.h"
+#include "clock.h"
 #include "machine.h"
 #include <stdlib.h>
 #include <stdio.h>

@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -g
 TARGET = kernel
-OBJS = kernel.o machine.o process.o clock_sys.o timer.o memory.o loader.o
+OBJS = kernel.o machine.o process.o clock.o timer.o memory.o loader.o
 
 # Default target
 all: $(TARGET)
@@ -11,19 +11,19 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
 # Compile each module
-kernel.o: kernel.c machine.h process.h clock_sys.h timer.h memory.h loader.h
+kernel.o: kernel.c machine.h process.h clock.h timer.h memory.h loader.h
 	$(CC) $(CFLAGS) -c kernel.c
 
 machine.o: machine.c machine.h process.h
 	$(CC) $(CFLAGS) -c machine.c
 
-process.o: process.c process.h clock_sys.h
+process.o: process.c process.h clock.h
 	$(CC) $(CFLAGS) -c process.c
 
-clock_sys.o: clock_sys.c clock_sys.h
-	$(CC) $(CFLAGS) -c clock_sys.c
+clock.o: clock.c clock.h
+	$(CC) $(CFLAGS) -c clock.c
 
-timer.o: timer.c timer.h clock_sys.h
+timer.o: timer.c timer.h clock.h
 	$(CC) $(CFLAGS) -c timer.c
 
 memory.o: memory.c memory.h

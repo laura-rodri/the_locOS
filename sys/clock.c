@@ -1,4 +1,4 @@
-#include "clock_sys.h"
+#include "clock.h"
 #include "machine.h"
 #include "process.h"
 #include "memory.h"
@@ -10,7 +10,8 @@
 int CLOCK_FREQUENCY_HZ = 1;
 
 pthread_mutex_t clk_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t clk_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t clk_cond = PTHREAD_COND_INITIALIZER;   // Condición para que timers esperen por ticks
+pthread_cond_t clk_cond2 = PTHREAD_COND_INITIALIZER;  // Condición para que reloj espere por timers
 volatile int clk_counter = 0;
 
 // Machine reference to decrement TTL of executing processes
@@ -29,6 +30,8 @@ void* clock_function(void* arg) {
         if (!running) break;
         
         pthread_mutex_lock(&clk_mutex);
+        
+        // Patrón T (reloj): Incrementar contador (done++)
         clk_counter++;
         
         printf("\033[33mClock tick %d\033[0m\n", clk_counter);
@@ -70,7 +73,12 @@ void* clock_function(void* arg) {
             }
         }
         
+        // Patrón T: Señalizar a los timers (cond_signal)
         pthread_cond_broadcast(&clk_cond);
+        
+        // Patrón T: Esperar confirmación de los timers (cond_wait con cond2)
+        pthread_cond_wait(&clk_cond2, &clk_mutex);
+        
         pthread_mutex_unlock(&clk_mutex);
     }
     return NULL;

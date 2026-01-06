@@ -18,7 +18,8 @@ extern volatile int running;
 
 // Synchronization primitives
 extern pthread_mutex_t clk_mutex;
-extern pthread_cond_t clk_cond;
+extern pthread_cond_t clk_cond;   // Condición para que timers esperen por ticks del reloj
+extern pthread_cond_t clk_cond2;  // Condición para que el reloj espere por timers
 
 // Machine reference for TTL decrement and instruction execution
 extern Machine* clock_machine_ref;
