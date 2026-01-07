@@ -35,3 +35,72 @@ Memoria virtual con paginación. La MMU traduce direcciones virtuales a físicas
 
 Los programas se generan con **prometheus** en formato `.elf` y se cargan mediante el loader. **heracles** es una utilidad para verificar la correcta decodificación de los archivos `.elf`, pero no se usa en el simulador.
 
+
+## Compilación Rápida
+
+```bash
+cd sys/
+make clean
+make
+./kernel
+```
+
+## Ejecución con Parámetros
+
+```bash
+# Round Robin, 10 Hz, quantum 5
+./kernel -f 10 -q 5 -policy 0 -sync 0
+
+# BFS, 5 Hz, quantum 3, sincronización con timer
+./kernel -f 5 -q 3 -policy 1 -sync 1
+
+# Prioridades preemptivas, 10 Hz, quantum 2
+./kernel -f 10 -q 2 -policy 2 -sync 0
+```
+
+## Creación de Programas
+
+```bash
+cd programs/
+./generar_programas.sh 2 10 40 #Genera 2 programas con entre 10 y 40 instrucciones
+```
+
+## Estructura del Código Fuente
+
+```
+../sys/
+├── kernel.c         → Main del kernel, integración
+├── process.h/c      → PCB, colas, generador, scheduler
+├── machine.h/c      → Machine, CPU, Core, HardwareThread
+├── memory.h/c       → Memoria física y virtual
+├── loader.h/c       → Cargador de programas
+├── clock_sys.h/c    → Reloj del sistema
+├── timer.h/c        → Timers de interrupción
+└── Makefile         → Compilación
+```
+## Programas de Ejemplo
+
+```
+../programs/
+├── prog000.elf          → Programa en formato prometheus
+├── prog001.elf          → Otro programa de ejemplo
+├── generar_programas.sh → Script para generar programas
+└── prometheus/          → Directorio con compilador prometheus
+```
+
+Formato de programa (.elf):
+```
+.text <dirección_hex>   # Inicio segmento código
+.data <dirección_hex>   # Inicio segmento datos
+<instrucción_hex>       # Instrucciones (8 dígitos hex/línea)
+...
+```
+
+## Autora
+
+Laura Rodríguez  
+UPV/EHU Universidad del País Vasco
+
+## Licencia
+
+Ver archivo LICENSE en la raíz del proyecto.
