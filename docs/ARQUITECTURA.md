@@ -8,7 +8,7 @@ the_locOS es un sistema operativo educativo que simula un kernel con gestión de
 
 ```
 Kernel
-├── Reloj del Sistema (SystemClock)
+├── Reloj del Sistema (Clock)
 │   └── Timers de Interrupción
 ├── Gestión de Procesos (ProcessGenerator + Scheduler)
 │   ├── Process Control Blocks (PCBs)

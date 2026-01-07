@@ -1257,16 +1257,6 @@ ProcessGenerator:
 
 5. **Inanición en Preemptive**: Procesos de baja prioridad pueden no ejecutarse
 
-### Posibles Extensiones Futuras
-
-1. **Swap a disco**: Implementar intercambio de páginas
-2. **Demand paging**: Cargar páginas bajo demanda
-3. **Copy-on-write**: Optimización para fork
-4. **Shared memory**: Páginas compartidas entre procesos
-5. **MLFQ**: Multi-Level Feedback Queue scheduler
-6. **Aging**: Evitar inanición en política preemptive
-7. **Estadísticas**: Métricas de rendimiento (turnaround time, waiting time, etc.)
-
 ### Análisis de Complejidad
 
 **Operaciones críticas**:
